@@ -1492,10 +1492,10 @@ async function onGenerateClick(){
     }
 
     // Escalonado por ítem para no saturar el límite de peticiones por
-    // minuto de la cuota gratuita de Gemini (free tier: pocas peticiones
-    // por minuto) cuando se generan varias publicaciones a la vez.
-    // 4.2s de separación deja margen real bajo ese límite.
-    await sleep(idx * 4200);
+    // minuto de la cuota gratuita de Gemini (free tier). Como ahora hay
+    // respaldo automático con Groq si Gemini falla, no hace falta un
+    // margen tan grande como antes.
+    await sleep(idx * 2000);
 
     const post = await buildPostWithAI(item);
     newPosts.push(post);
@@ -2134,7 +2134,12 @@ function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 // sin cuota gratuita, o falla por cualquier razón, se cae automáticamente
 // al modo de plantillas local (buildPostTemplate) para que la app nunca
 // deje de funcionar.
-async function buildPostWithAI(item, retryOn429 = true){
+// Genera el texto de la publicación con IA. El backend (generate-post.js)
+// intenta primero Gemini y, si falla por cuota u otro error, cae
+// automáticamente a Groq como respaldo. Solo si AMBOS fallan (o no están
+// configurados) esta función cae al modo de plantillas local
+// (buildPostTemplate) para que la app nunca deje de funcionar.
+async function buildPostWithAI(item){
   try{
     const res = await fetch("/.netlify/functions/generate-post", {
       method: "POST",
@@ -2149,13 +2154,6 @@ async function buildPostWithAI(item, retryOn429 = true){
       })
     });
     const json = await res.json();
-    if (res.status === 429 && retryOn429){
-      // Cuota por minuto agotada momentáneamente (no la diaria): esperamos
-      // un poco y reintentamos UNA vez antes de rendirnos a la plantilla.
-      log(`Cuota de Gemini saturada para "${item.title}", reintentando en 20s…`, "err");
-      await sleep(20000);
-      return buildPostWithAI(item, false);
-    }
     if (!res.ok || !json.text){
       throw new Error(json.error || `HTTP ${res.status}`);
     }
