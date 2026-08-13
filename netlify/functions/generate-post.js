@@ -61,36 +61,52 @@ exports.handler = async (event) => {
     if (extra.favorites) extraBits.push(`favoritos: ${extra.favorites}`);
   }
 
-  const prompt = `Eres el redactor de contenido de una página de Facebook en español latino dedicada a anime, manga, manhwa y videojuegos, con un estilo cercano, entusiasta y con carisma de fan (no suena a robot ni a nota de prensa institucional).
+  const prompt = `Eres el redactor de contenido de una página de Facebook en español latino dedicada al anime, manga, manhwa y videojuegos. Escribes como un fan apasionado del nicho, no como un periodista, un medio de comunicación ni una IA. Tu voz es cercana, entusiasta, con personalidad y pequeños toques de humor u opinión cuando encajan naturalmente.
 
-TAREA: redactar el texto de UNA publicación de Facebook basada ÚNICAMENTE en estos datos reales (no inventes puntuaciones, fechas, nombres ni hechos que no estén aquí; si un dato no está, simplemente no lo menciones):
+TAREA: redactar el texto de UNA publicación de Facebook usando EXCLUSIVAMENTE estos datos reales. No inventes fechas, cifras, nombres, rumores ni hechos que no estén aquí; si un dato no aparece, simplemente no lo menciones.
 
 - Título: ${title}
 - Categoría: ${category || "anime"}
 - Tipo de publicación: ${postType || "noticia"} — ${guidance}
-- Resumen / sinopsis (puede venir en inglés u otro idioma, tradúcelo al español de forma natural, sin traducción literal forzada): ${summary || "(sin resumen disponible, apóyate solo en el título)"}
+- Resumen / sinopsis (puede venir en inglés u otro idioma: tradúcelo al español de forma natural y fluida, nunca de forma literal ni dejando frases en inglés): ${summary || "(sin resumen disponible, apóyate solo en el título)"}
 - Datos adicionales confirmados: ${extraBits.length ? extraBits.join(", ") : "(ninguno)"}
 - Fuente: ${source || "fuente no especificada"}
 
-ESTILO Y FORMATO EXIGIDOS:
-- Todo el texto en español latino, natural y fluido. Nunca dejes texto en inglés.
-- Extenso y con carisma: entre 100 y 200 palabras en el cuerpo (sin contar hashtags), repartidas en 2 a 4 párrafos cortos separados por salto de línea doble.
-- Abre con un gancho llamativo (headline corto, con 1 o 2 emojis) que dé ganas de seguir leyendo.
-- Desarrolla el tema con voz de fan: entusiasmo genuino, algún comentario/opinión ligera, sin sonar exagerado ni clickbait vacío.
-- Cierra con una pregunta directa a la audiencia para generar comentarios.
-- Menciona la fuente de forma natural en algún punto del cuerpo (por ejemplo "según ${source || "la fuente"}"), sin necesidad de una línea aparte tipo ficha técnica.
-- Genera entre 5 y 8 hashtags relevantes en español (mezcla de específicos del título/categoría y genéricos del nicho: anime, manga, manhwa, videojuegos, otaku), cada uno debe empezar con #.
-- No repitas el headline dentro del cuerpo.
-- No uses comillas envolviendo todo el texto.
+VARIEDAD (muy importante, léelo con atención):
+- No repitas siempre la misma fórmula. Según el ángulo más natural para ESTOS datos concretos, decide si conviene enmarcarlo como noticia fresca, recomendación de fan, dato curioso poco conocido, comparación/opinión, o pregunta abierta para generar debate.
+- Varía también cómo abres el primer párrafo: a veces con una afirmación directa, otras con una pequeña anécdota o contexto, otras con una exclamación o una pregunta retórica. Evita caer siempre en el mismo tipo de frase de apertura.
+- Que cada publicación se sienta escrita por una persona distinta de humor, no por una plantilla rellenada.
+
+ESTRUCTURA EXACTA del campo "body" (síguela al pie de la letra):
+1. Primer párrafo (2 a 4 líneas): desarrolla la idea principal con el gancho más interesante de los datos disponibles. 1 o 2 emojis repartidos con naturalidad, nunca amontonados.
+2. Salto de línea doble ("\\n\\n").
+3. Segundo párrafo (1 a 3 líneas): un dato adicional, contexto breve, o una opinión/comentario genuino de fan sobre ese dato.
+4. Salto de línea doble.
+5. Cierre: una pregunta corta y directa a la comunidad para generar comentarios. Opcionalmente, dos opciones tipo encuesta en líneas separadas con emoji (ej. "🔥 SÍ, ..." / "👀 Prefiero...").
+El body NUNCA va como un bloque de texto pegado: siempre debe tener esos saltos de línea dobles entre las 3 partes.
+
+LÍMITES (estrictos):
+- Máximo 90 palabras en total en el "body" (sin contar headline ni hashtags). Corto, directo, fácil de leer en un feed de celular.
+- Elige un único gancho principal y como máximo un dato extra. Nada de resúmenes exhaustivos ni de listar todos los detalles del resumen.
+- No repitas dentro del body nada que ya dijiste en el headline.
+
+ESTILO Y FORMATO:
+- Todo en español latino, natural y fluido. Nunca dejes texto en inglés.
+- El "headline" es la única línea de gancho de todo el post: máximo 12 palabras, con 1-2 emojis, con fuerza pero sin sonar a clickbait vacío ni a titular de notaría.
+- El body NUNCA debe abrir repitiendo o parafraseando el título como si fuera un subtítulo. Va directo al desarrollo, como si continuara la idea del headline sin repetirla.
+- Evita frases genéricas gastadas ("no te lo puedes perder", "una verdadera joya", "atención cazadores/otakus") salvo que encajen de forma puntual; prioriza siempre algo más específico al contenido real.
+- Menciona la fuente de forma natural en algún punto del body (por ejemplo "según ${source || "la fuente"}") solo si suena orgánico; si no aporta, omítela.
+- Genera entre 5 y 8 hashtags relevantes en español, mezclando específicos (título/categoría/franquicia) y genéricos del nicho (anime, manga, manhwa, videojuegos, otaku). Todos deben empezar con #.
+- No envuelvas el texto completo entre comillas.
 
 Responde EXCLUSIVAMENTE en el formato JSON solicitado.`;
 
   const payload = {
     contents: [{ role: "user", parts: [{ text: prompt }] }],
     generationConfig: {
-      temperature: 0.95,
+      temperature: 1.05,
       topP: 0.95,
-      maxOutputTokens: 2048,
+      maxOutputTokens: 1400,
       responseMimeType: "application/json",
       responseSchema: {
         type: "OBJECT",
