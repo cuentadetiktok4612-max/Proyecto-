@@ -22,7 +22,13 @@ const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GE
 // Free tier de Groq es mucho más amplio (miles de requests/día). Se consigue
 // gratis en https://console.groq.com/keys (no pide tarjeta).
 // Variable de entorno requerida en Netlify: GROQ_API_KEY
-const GROQ_MODEL = "llama-3.3-70b-versatile";
+//
+// Se usa gpt-oss-120b en vez de llama-3.3-70b-versatile: Llama 3.3 ignora
+// instrucciones largas y estructuradas (devuelve posts cortos, sin párrafos
+// separados ni hashtags suficientes). gpt-oss-120b sigue mucho mejor
+// prompts extensos con reglas estrictas, con una cuota gratis similar
+// (1000 req/día en Groq).
+const GROQ_MODEL = "openai/gpt-oss-120b";
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 
 const POST_TYPE_GUIDANCE = {
@@ -133,7 +139,14 @@ Responde EXCLUSIVAMENTE en el formato JSON solicitado.`;
   // 2) Respaldo con Groq (si Gemini no está configurado, falló, o no hay clave de Gemini).
   if (groqKey) {
     try {
-      const result = await tryGroq(prompt, groqKey);
+      let result = await tryGroq(prompt, groqKey);
+      // Si el fallo es por calidad (no por cuota/red), reintentamos UNA vez:
+      // con temperature/top_p ya usados, un segundo intento suele bastar
+      // para que respete la estructura. No reintenta ante 429 (cuota) para
+      // no desperdiciarla.
+      if (!result.ok && result.status !== 429 && /no cumple los estándares de calidad/.test(result.error || "")) {
+        result = await tryGroq(prompt, groqKey);
+      }
       if (result.ok) {
         return jsonResponse(result.data, 200);
       }
@@ -238,6 +251,48 @@ async function tryGroq(prompt, groqKey) {
   return parsePostJSON(rawText, "Groq");
 }
 
+// Valida que el post cumpla las reglas mínimas del prompt. Si algún modelo
+// (sobre todo el de respaldo) devuelve algo demasiado corto, sin párrafos
+// separados o sin hashtags suficientes, esto lo detecta para que el
+// llamador pueda reintentar o caer al siguiente proveedor en vez de
+// aceptar en silencio una publicación pobre.
+function validatePost(parsed) {
+  const problems = [];
+
+  const body = (parsed.body || "").trim();
+  const headline = (parsed.headline || "").trim();
+  const hashtags = Array.isArray(parsed.hashtags) ? parsed.hashtags.filter(h => typeof h === "string" && h.trim()) : [];
+
+  const bodyWordCount = body ? body.split(/\s+/).filter(Boolean).length : 0;
+  if (bodyWordCount < 25) {
+    problems.push(`body demasiado corto (${bodyWordCount} palabras, se esperan al menos ~25-30)`);
+  }
+
+  // La estructura pide: párrafo 1 \n\n párrafo 2 \n\n cierre con pregunta.
+  // Eso implica al menos 2 saltos de línea dobles (3 bloques).
+  const paragraphBlocks = body.split(/\n\s*\n/).map(b => b.trim()).filter(Boolean);
+  if (paragraphBlocks.length < 3) {
+    problems.push(`faltan saltos de párrafo (se encontraron ${paragraphBlocks.length} bloques, se esperan 3: párrafo, dato/opinión, pregunta de cierre)`);
+  }
+
+  if (hashtags.length < 5) {
+    problems.push(`muy pocos hashtags (${hashtags.length}, se esperan 5-8)`);
+  }
+
+  if (!headline) {
+    problems.push("falta headline");
+  }
+
+  // El cierre debe terminar en pregunta (o incluir una línea de encuesta),
+  // como pide el prompt para generar comentarios.
+  const lastBlock = paragraphBlocks[paragraphBlocks.length - 1] || "";
+  if (lastBlock && !lastBlock.includes("?") && !/¿/.test(lastBlock)) {
+    problems.push("el cierre no parece una pregunta a la comunidad");
+  }
+
+  return { valid: problems.length === 0, problems };
+}
+
 // Parsea el JSON { headline, body, hashtags } devuelto por cualquiera de
 // los dos proveedores y arma la respuesta final común.
 function parsePostJSON(rawText, providerName) {
@@ -264,6 +319,15 @@ function parsePostJSON(rawText, providerName) {
 
   if (!parsed.headline || !parsed.body) {
     return { ok: false, error: `Respuesta de ${providerName} incompleta.`, status: 502 };
+  }
+
+  const check = validatePost(parsed);
+  if (!check.valid) {
+    return {
+      ok: false,
+      error: `Respuesta de ${providerName} no cumple los estándares de calidad: ${check.problems.join("; ")}.`,
+      status: 502
+    };
   }
 
   const hashtags = Array.isArray(parsed.hashtags)
