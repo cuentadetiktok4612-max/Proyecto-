@@ -132,11 +132,29 @@ Responde EXCLUSIVAMENTE en el formato JSON solicitado.`;
       return jsonResponse({ error: "Gemini no devolvió contenido (posible bloqueo de seguridad)." }, 502);
     }
 
+    // Gemini a veces envuelve el JSON en un bloque de código markdown
+    // (```json ... ```) aunque se le pida responseMimeType "application/json".
+    // Limpiamos eso antes de intentar parsear.
+    let cleanText = rawText.trim();
+    if (cleanText.startsWith("```")) {
+      cleanText = cleanText.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
+    }
+    // A veces también puede venir con texto antes/después del JSON; intentamos
+    // extraer el primer objeto { ... } completo como último recurso.
     let parsed;
     try {
-      parsed = JSON.parse(rawText);
+      parsed = JSON.parse(cleanText);
     } catch (e) {
-      return jsonResponse({ error: "No se pudo interpretar la respuesta de Gemini como JSON." }, 502);
+      const match = cleanText.match(/\{[\s\S]*\}/);
+      if (match) {
+        try {
+          parsed = JSON.parse(match[0]);
+        } catch (e2) {
+          return jsonResponse({ error: "No se pudo interpretar la respuesta de Gemini como JSON. Fragmento: " + cleanText.slice(0, 200) }, 502);
+        }
+      } else {
+        return jsonResponse({ error: "No se pudo interpretar la respuesta de Gemini como JSON. Fragmento: " + cleanText.slice(0, 200) }, 502);
+      }
     }
 
     if (!parsed.headline || !parsed.body) {
