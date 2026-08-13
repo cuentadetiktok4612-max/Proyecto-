@@ -56,10 +56,17 @@ exports.handler = async (event) => {
     return jsonResponse({ error: "Cuerpo de solicitud inválido." }, 400);
   }
 
-  const { title, postType, category, summary, extra, source } = item;
-  if (!title) {
+  let { title, postType, category, summary, extra, source } = item;
+  if (!title || typeof title !== "string" || !title.trim()) {
     return jsonResponse({ error: "Falta el título del ítem." }, 400);
   }
+
+  // Saneo básico de entrada: recorta campos de texto libre a un largo
+  // razonable para no inflar el prompt innecesariamente (ni gastar tokens)
+  // si algún feed trae una sinopsis gigante o un título anormalmente largo.
+  title = title.trim().slice(0, 200);
+  summary = typeof summary === "string" ? summary.trim().slice(0, 1500) : summary;
+  source = typeof source === "string" ? source.trim().slice(0, 100) : source;
 
   const guidance = POST_TYPE_GUIDANCE[postType] || POST_TYPE_GUIDANCE.noticia;
 
@@ -345,7 +352,8 @@ function parsePostJSON(rawText, providerName) {
     ok: true,
     data: {
       headline: parsed.headline.trim(),
-      text: fullText
+      text: fullText,
+      provider: providerName
     }
   };
 }
