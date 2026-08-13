@@ -936,7 +936,13 @@ const REDDIT_FEEDS = [
   { name: "r/AnimeFunny",  url: "https://www.reddit.com/r/Animemes/top/.rss?t=day",    baseCats: ["curiosidades"] }
 ];
 
-const CORS_PROXY = "https://api.allorigins.win/raw?url=";
+// Proxy CORS principal, con uno de respaldo por si el primero está caído o
+// lento (ambos son servicios públicos gratis, sin key, y pueden fallar sin
+// aviso). fetchWithCorsProxy intenta el primero y, si falla, el segundo.
+const CORS_PROXIES = [
+  "https://api.allorigins.win/raw?url=",
+  "https://corsproxy.io/?url="
+];
 
 const STORAGE_KEY_POSTS = "otagen_posts_v3";
 const STORAGE_KEY_SEEN  = "otagen_seen_ids_v3";
@@ -1591,10 +1597,19 @@ function pickDiverse(list, n){
    FUENTE 1: JIKAN (MyAnimeList) — CORS habilitado, sin key
    ========================================================= */
 async function jikanGet(path){
-  const res = await fetch(JIKAN_BASE + path);
-  if (!res.ok) throw new Error("HTTP " + res.status);
-  const json = await res.json();
-  return json.data || [];
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  try{
+    const res = await fetch(JIKAN_BASE + path, { signal: controller.signal });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const json = await res.json();
+    return json.data || [];
+  }catch(e){
+    if (e.name === "AbortError") throw new Error("Tiempo de espera agotado (Jikan)");
+    throw e;
+  }finally{
+    clearTimeout(timeout);
+  }
 }
 
 function jikanImage(entry){
@@ -1757,15 +1772,25 @@ function buildSynopsisSummary(synopsis, title){
    FUENTE 2: ANILIST — GraphQL, CORS abierto, sin key
    ========================================================= */
 async function aniListQuery(query, variables){
-  const res = await fetch(ANILIST_ENDPOINT, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Accept": "application/json" },
-    body: JSON.stringify({ query, variables })
-  });
-  if (!res.ok) throw new Error("HTTP " + res.status);
-  const json = await res.json();
-  if (json.errors) throw new Error(json.errors[0]?.message || "GraphQL error");
-  return json.data;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  try{
+    const res = await fetch(ANILIST_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify({ query, variables }),
+      signal: controller.signal
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const json = await res.json();
+    if (json.errors) throw new Error(json.errors[0]?.message || "GraphQL error");
+    return json.data;
+  }catch(e){
+    if (e.name === "AbortError") throw new Error("Tiempo de espera agotado (AniList)");
+    throw e;
+  }finally{
+    clearTimeout(timeout);
+  }
 }
 
 // Manhwa (origen Corea) en tendencia → "Manhwa"
@@ -1834,14 +1859,35 @@ async function fetchAniListTrendingAnime(){
   }));
 }
 
+// Intenta traer una URL a través de la lista de proxies CORS en orden,
+// pasando al siguiente si el actual falla (HTTP no-ok, timeout o error de
+// red). Solo lanza error si TODOS los proxies fallan, para que una fuente
+// individual no se pierda solo porque el proxy principal tuvo un mal momento.
+async function fetchWithCorsProxy(targetUrl){
+  let lastError;
+  for (const proxy of CORS_PROXIES){
+    try{
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 12000);
+      const res = await fetch(proxy + encodeURIComponent(targetUrl), {
+        cache: "no-store",
+        signal: controller.signal
+      });
+      clearTimeout(timeout);
+      if (!res.ok) { lastError = new Error("HTTP " + res.status); continue; }
+      return await res.text();
+    }catch(e){
+      lastError = e.name === "AbortError" ? new Error("Tiempo de espera agotado") : e;
+    }
+  }
+  throw lastError || new Error("Todos los proxies CORS fallaron");
+}
+
 /* =========================================================
    FUENTE 3: RSS (videojuegos y noticias generales) — vía proxy
    ========================================================= */
 async function fetchRssFeed(feed){
-  const url = CORS_PROXY + encodeURIComponent(feed.url);
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) throw new Error("HTTP " + res.status);
-  const text = await res.text();
+  const text = await fetchWithCorsProxy(feed.url);
 
   const parser = new DOMParser();
   const xml = parser.parseFromString(text, "text/xml");
@@ -1915,10 +1961,7 @@ function parseAtomEntry(e, feed){
    por separado y se marcan como contenido de comunidad, no editorial.
    ========================================================= */
 async function fetchRedditFeed(feed){
-  const url = CORS_PROXY + encodeURIComponent(feed.url);
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) throw new Error("HTTP " + res.status);
-  const text = await res.text();
+  const text = await fetchWithCorsProxy(feed.url);
 
   const parser = new DOMParser();
   const xml = parser.parseFromString(text, "text/xml");
@@ -2140,6 +2183,11 @@ function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 // configurados) esta función cae al modo de plantillas local
 // (buildPostTemplate) para que la app nunca deje de funcionar.
 async function buildPostWithAI(item){
+  const controller = new AbortController();
+  // 55s: da margen a que el backend agote sus propios reintentos internos
+  // (Gemini hasta 2 intentos de 20s + Groq hasta 2 intentos), sin dejar al
+  // usuario esperando indefinidamente si la function completa se cuelga.
+  const timeout = setTimeout(() => controller.abort(), 55000);
   try{
     const res = await fetch("/.netlify/functions/generate-post", {
       method: "POST",
@@ -2151,11 +2199,15 @@ async function buildPostWithAI(item){
         summary: item.summary,
         extra: item.extra || null,
         source: item.source
-      })
+      }),
+      signal: controller.signal
     });
     const json = await res.json();
     if (!res.ok || !json.text){
       throw new Error(json.error || `HTTP ${res.status}`);
+    }
+    if (json.provider){
+      log(`"${item.title}" redactado con ${json.provider}.`, "ok");
     }
     return {
       id: cryptoRandomId(),
@@ -2175,8 +2227,11 @@ async function buildPostWithAI(item){
       createdAt: new Date().toISOString()
     };
   }catch(e){
-    log(`IA no disponible para "${item.title}" (${e.message || e}). Usando plantilla local de respaldo.`, "err");
+    const message = e.name === "AbortError" ? "tiempo de espera agotado" : (e.message || e);
+    log(`IA no disponible para "${item.title}" (${message}). Usando plantilla local de respaldo.`, "err");
     return buildPostTemplate(item);
+  }finally{
+    clearTimeout(timeout);
   }
 }
 
@@ -2391,9 +2446,24 @@ async function onPublishClick(p){
       flashCopied(p.id, "Publicado en tu página ✓");
       return;
     }catch(e){
-      log(`Fallo publicando "${p.title}" vía API (${e.message || e}). Cambiando a modo manual.`, "err");
+      const msg = e.message || String(e);
+      log(`Fallo publicando "${p.title}" vía API (${msg}). Cambiando a modo manual.`, "err");
       if (fbBtn){ fbBtn.disabled = false; fbBtn.textContent = "Publicar en Facebook"; }
-      alert("No se pudo publicar automáticamente (" + (e.message || e) + "). Revisa tu token en Conectar Facebook, o publica de forma manual: se copió el texto y se abrirá Facebook.");
+
+      // Los mensajes de Graph API para token vencido/inválido/revocado son
+      // reconocibles por texto; se detecta para dar una instrucción clara
+      // en vez del JSON crudo de error, que confunde a alguien sin
+      // experiencia técnica.
+      const looksLikeAuthError = /session has expired|token.*(expired|invalid)|error validating access token|has not authorized application/i.test(msg);
+      if (looksLikeAuthError){
+        fbCreds = { pageId: "", token: "" };
+        saveFbCreds();
+        updateFbConfigButtonState();
+        renderFeed();
+        alert("Tu conexión con Facebook venció o fue revocada. Ve a \"Conectar mi página de Facebook\" y vuelve a iniciar sesión para renovarla. Mientras tanto, se copió el texto y se abrirá Facebook para que publiques manualmente.");
+      } else {
+        alert("No se pudo publicar automáticamente (" + msg + "). Revisa tu token en Conectar Facebook, o publica de forma manual: se copió el texto y se abrirá Facebook.");
+      }
       // sigue al modo manual como respaldo
     }
   }
