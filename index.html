@@ -1118,7 +1118,7 @@ async function onFbConfigTest(){
 
 // ID pública de la app de Facebook (esto SÍ puede ir en el frontend, solo
 // el App Secret debe quedarse en el servidor). Configúralo con tu App ID.
-const FB_OAUTH_APP_ID = "4065754450395443";
+const FB_OAUTH_APP_ID = "1619589499822230";
 // Debe coincidir EXACTO con FB_REDIRECT_URI en las variables de entorno de
 // Netlify y con la URI registrada en Facebook Developers > Facebook Login > Settings.
 const FB_OAUTH_REDIRECT_URI = "https://generadordepubli.netlify.app/.netlify/functions/fb-auth";
@@ -2469,8 +2469,15 @@ async function onPublishClick(p){
   }
 
   copyText(p.postText).finally(() => {
-    window.open("https://www.facebook.com/", "_blank", "noopener,noreferrer");
-    flashCopied(p.id);
+    // Se intenta abrir directo la pantalla de "crear publicación" en vez de
+    // solo la portada de Facebook, para ahorrar un par de toques dentro de
+    // la app. Si el dispositivo no tiene la app instalada, Facebook redirige
+    // automáticamente a la versión web equivalente.
+    window.open("fb://composer", "_blank");
+    setTimeout(() => {
+      window.open("https://www.facebook.com/", "_blank", "noopener,noreferrer");
+    }, 400);
+    flashCopied(p.id, "Texto copiado ✓ — pégalo en la publicación");
   });
 }
 
