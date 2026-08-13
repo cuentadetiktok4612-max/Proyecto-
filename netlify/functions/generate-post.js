@@ -90,7 +90,7 @@ Responde EXCLUSIVAMENTE en el formato JSON solicitado.`;
     generationConfig: {
       temperature: 0.95,
       topP: 0.95,
-      maxOutputTokens: 900,
+      maxOutputTokens: 2048,
       responseMimeType: "application/json",
       responseSchema: {
         type: "OBJECT",
@@ -105,21 +105,7 @@ Responde EXCLUSIVAMENTE en el formato JSON solicitado.`;
   };
 
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 25000);
-
-    const res = await fetch(GEMINI_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": apiKey
-      },
-      body: JSON.stringify(payload),
-      signal: controller.signal
-    });
-    clearTimeout(timeout);
-
-    const json = await res.json();
+    const { json, res } = await callGeminiWithRetry(payload, apiKey);
 
     if (!res.ok) {
       const message = json?.error?.message || `HTTP ${res.status}`;
@@ -127,9 +113,16 @@ Responde EXCLUSIVAMENTE en el formato JSON solicitado.`;
       return jsonResponse({ error: message }, res.status);
     }
 
-    const rawText = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+    const candidate = json?.candidates?.[0];
+    const rawText = candidate?.content?.parts?.[0]?.text;
+
     if (!rawText) {
-      return jsonResponse({ error: "Gemini no devolvió contenido (posible bloqueo de seguridad)." }, 502);
+      const reason = candidate?.finishReason || "desconocida";
+      return jsonResponse({ error: `Gemini no devolvió contenido (posible bloqueo de seguridad o corte, razón: ${reason}).` }, 502);
+    }
+
+    if (candidate?.finishReason === "MAX_TOKENS") {
+      return jsonResponse({ error: "La respuesta de Gemini se cortó por límite de tokens (MAX_TOKENS). Sube maxOutputTokens." }, 502);
     }
 
     // Gemini a veces envuelve el JSON en un bloque de código markdown
@@ -161,8 +154,10 @@ Responde EXCLUSIVAMENTE en el formato JSON solicitado.`;
       return jsonResponse({ error: "Respuesta de Gemini incompleta." }, 502);
     }
 
-    const hashtags = Array.isArray(parsed.hashtags) ? parsed.hashtags.filter(Boolean) : [];
-    const hashtagLine = hashtags.map(h => h.startsWith("#") ? h : "#" + h).join(" ");
+    const hashtags = Array.isArray(parsed.hashtags)
+      ? parsed.hashtags.filter(h => typeof h === "string" && h.trim())
+      : [];
+    const hashtagLine = hashtags.map(h => h.trim().startsWith("#") ? h.trim() : "#" + h.trim()).join(" ");
 
     const fullText = [parsed.headline, "", parsed.body.trim(), hashtagLine]
       .filter(line => line !== undefined && line !== null)
@@ -180,6 +175,46 @@ Responde EXCLUSIVAMENTE en el formato JSON solicitado.`;
     return jsonResponse({ error: message }, 500);
   }
 };
+
+async function callGeminiOnce(payload, apiKey, timeoutMs) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(GEMINI_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": apiKey
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal
+    });
+    const json = await res.json().catch(() => ({}));
+    return { json, res };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// Reintenta UNA vez, solo ante fallos transitorios (5xx o timeout/abort).
+// Nunca reintenta ante 429 (cuota agotada) ni 4xx de petición mal formada,
+// para no desperdiciar cuota ni demorar innecesariamente la caída a plantillas.
+async function callGeminiWithRetry(payload, apiKey) {
+  try {
+    const first = await callGeminiOnce(payload, apiKey, 20000);
+    if (first.res.ok || first.res.status === 429 || first.res.status === 400) {
+      return first;
+    }
+    // Error transitorio (5xx): un segundo intento con margen algo mayor.
+    return await callGeminiOnce(payload, apiKey, 20000);
+  } catch (e) {
+    if (e.name === "AbortError") {
+      // Timeout en el primer intento: probamos una vez más.
+      return await callGeminiOnce(payload, apiKey, 20000);
+    }
+    throw e;
+  }
+}
 
 function jsonResponse(obj, statusCode = 200) {
   return {
