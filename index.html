@@ -1,0 +1,2710 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>OtaGen — Generador de publicaciones</title>
+<style>
+  :root{
+    --bg: #0f1216;
+    --bg-elev: #161a20;
+    --bg-card: #1b2028;
+    --line: #262c36;
+    --ink: #eef1f5;
+    --ink-dim: #9aa4b2;
+    --ink-faint: #626d7c;
+
+    --accent: #ff5d3b;
+    --accent-ink: #1a0d08;
+    --accent-soft: #3a2118;
+
+    --cat-anime: #ff5d3b;
+    --cat-manga: #7c9eff;
+    --cat-manhwa: #34d3a8;
+    --cat-videojuegos: #d97dff;
+    --cat-colaboraciones: #ffc857;
+    --cat-polemicas: #ff5c7a;
+    --cat-adaptaciones: #6bd0ff;
+    --cat-liveaction: #ff9d4d;
+    --cat-curiosidades: #b7ff5c;
+    --cat-estrenos: #ff5da0;
+
+    --radius: 14px;
+    --radius-sm: 9px;
+    --font-display: 'Rubik', -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    --font-mono: "SFMono-Regular", Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html { -webkit-text-size-adjust: 100%; }
+
+  body{
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-body);
+    line-height: 1.5;
+    min-height: 100vh;
+    padding-bottom: 48px;
+  }
+
+  /* subtle scanline / halftone backdrop */
+  body::before{
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    background-image:
+      radial-gradient(circle at 1px 1px, rgba(255,255,255,0.035) 1px, transparent 0);
+    background-size: 18px 18px;
+  }
+
+  a { color: inherit; }
+
+  /* ---------- HEADER ---------- */
+  header.top{
+    position: relative;
+    z-index: 1;
+    padding: 22px 18px 20px;
+    border-bottom: 1px solid var(--line);
+    background:
+      linear-gradient(180deg, rgba(255,93,59,0.08), transparent 70%);
+  }
+
+  .brand{
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+  }
+
+  .brand .mark{
+    font-family: var(--font-display);
+    font-weight: 800;
+    font-size: 1.5rem;
+    letter-spacing: -0.02em;
+    color: var(--ink);
+  }
+  .brand .mark span{ color: var(--accent); }
+
+  .brand .tag{
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--ink-faint);
+    font-family: var(--font-mono);
+  }
+
+  .status-line{
+    margin-top: 14px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--ink-faint);
+  }
+  .status-dot{
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--ink-faint);
+    flex-shrink: 0;
+  }
+  .status-dot.ok{ background: var(--cat-manhwa); box-shadow: 0 0 8px var(--cat-manhwa); }
+  .status-dot.busy{ background: var(--ink-faint); animation: pulse 1s infinite ease-in-out; }
+  .status-dot.err{ background: var(--cat-polemicas); }
+  @keyframes pulse{ 0%,100%{ opacity: 1; } 50%{ opacity: 0.25; } }
+
+  .fb-config-btn{
+    margin-top: 12px;
+    appearance: none;
+    border: 1px solid var(--line);
+    background: var(--bg-elev);
+    color: var(--ink-dim);
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    padding: 8px 12px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .fb-config-btn.connected{
+    border-color: var(--cat-manhwa);
+    color: var(--cat-manhwa);
+  }
+
+  /* ---------- MODAL ---------- */
+  .modal-overlay{
+    position: fixed; inset: 0;
+    background: rgba(5,6,8,0.72);
+    backdrop-filter: blur(3px);
+    z-index: 50;
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+  }
+  .modal-overlay.hidden{ display: none; }
+  .modal-sheet{
+    width: 100%;
+    max-width: 560px;
+    max-height: 88vh;
+    overflow-y: auto;
+    background: var(--bg-card);
+    border: 1px solid var(--line);
+    border-bottom: none;
+    border-radius: 18px 18px 0 0;
+    padding: 22px 20px calc(22px + env(safe-area-inset-bottom));
+  }
+  .modal-sheet h2{
+    font-family: var(--font-display);
+    font-size: 1.1rem;
+    margin-bottom: 6px;
+  }
+  .modal-sheet p{
+    font-size: 0.82rem;
+    color: var(--ink-dim);
+    line-height: 1.55;
+    margin-bottom: 14px;
+  }
+  .modal-sheet .field{
+    margin-bottom: 14px;
+  }
+  .modal-sheet label{
+    display: block;
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    color: var(--ink-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 6px;
+  }
+  .modal-sheet input[type="text"], .modal-sheet input[type="password"]{
+    width: 100%;
+    background: var(--bg-elev);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    color: var(--ink);
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    padding: 11px 12px;
+  }
+  .modal-sheet input:focus{ outline: none; border-color: var(--accent); }
+  .modal-steps{
+    background: var(--bg-elev);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    padding: 12px 14px;
+    margin-bottom: 16px;
+    font-size: 0.78rem;
+    color: var(--ink-dim);
+    line-height: 1.7;
+  }
+  .modal-steps a{ color: var(--accent); }
+
+  .token-converter{
+    background: var(--bg-elev);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    margin-bottom: 16px;
+    overflow: hidden;
+  }
+  .token-converter summary{
+    padding: 12px 14px;
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: var(--accent);
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
+  .token-converter summary::-webkit-details-marker{ display: none; }
+  .token-converter summary .icon-svg{ width: 14px; height: 14px; flex-shrink: 0; }
+  .token-converter[open] summary{ border-bottom: 1px solid var(--line); }
+  .token-converter-body{ padding: 14px; }
+  .token-converter-body .tc-note{
+    font-size: 0.76rem;
+    color: var(--ink-faint);
+    line-height: 1.5;
+    margin-bottom: 12px;
+  }
+  .token-converter-body .field{ margin-bottom: 10px; }
+  .modal-actions{
+    display: flex;
+    gap: 10px;
+    margin-top: 4px;
+  }
+  .modal-close{
+    position: absolute;
+    top: 14px; right: 16px;
+    background: none;
+    border: none;
+    color: var(--ink-faint);
+    cursor: pointer;
+    line-height: 1;
+    display: flex;
+  }
+  .modal-close .icon-svg{ width: 18px; height: 18px; }
+  .modal-sheet{ position: relative; }
+  .modal-test-result{
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    margin-top: 10px;
+    min-height: 1.2em;
+  }
+  .modal-test-result.ok{ color: var(--cat-manhwa); }
+  .modal-test-result.err{ color: var(--cat-polemicas); }
+
+  /* ---------- CONTROLS ---------- */
+  .controls{
+    position: relative;
+    z-index: 1;
+    padding: 16px 18px 4px;
+  }
+
+  .controls-row{
+    display: flex;
+    gap: 10px;
+    align-items: center;
+  }
+
+  .count-field{
+    display: flex;
+    align-items: center;
+    background: var(--bg-elev);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+  .count-field label{
+    font-size: 0.68rem;
+    font-family: var(--font-mono);
+    color: var(--ink-faint);
+    padding: 0 10px;
+    white-space: nowrap;
+  }
+  .count-field input{
+    width: 52px;
+    background: transparent;
+    border: none;
+    border-left: 1px solid var(--line);
+    color: var(--ink);
+    font-family: var(--font-mono);
+    font-size: 0.95rem;
+    padding: 10px 8px;
+    text-align: center;
+  }
+  .count-field input:focus{ outline: none; background: rgba(255,93,59,0.08); }
+
+  .btn{
+    appearance: none;
+    border: none;
+    border-radius: var(--radius-sm);
+    font-family: var(--font-body);
+    font-weight: 600;
+    font-size: 0.86rem;
+    padding: 11px 16px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    transition: transform 0.12s ease, opacity 0.12s ease;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .btn:active{ transform: scale(0.96); }
+  .btn:disabled{ opacity: 0.5; pointer-events: none; }
+
+  .btn-primary{
+    background: var(--accent);
+    color: var(--accent-ink);
+    flex: 1;
+  }
+  .btn-ghost{
+    background: var(--bg-elev);
+    color: var(--ink-dim);
+    border: 1px solid var(--line);
+  }
+  .btn-fb{
+    background: #1877f2;
+    color: #fff;
+    width: 100%;
+  }
+  .btn-sm{
+    padding: 7px 11px;
+    font-size: 0.74rem;
+  }
+
+  .row-secondary{
+    display: flex;
+    gap: 10px;
+    margin-top: 10px;
+  }
+
+  /* ---------- FILTER CHIPS ---------- */
+  .filters{
+    position: relative;
+    z-index: 1;
+    display: flex;
+    gap: 7px;
+    overflow-x: auto;
+    padding: 14px 18px 6px;
+    scrollbar-width: none;
+  }
+  .filters::-webkit-scrollbar{ display: none; }
+
+  .chip{
+    flex-shrink: 0;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.02em;
+    padding: 7px 12px;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    background: var(--bg-elev);
+    color: var(--ink-dim);
+    cursor: pointer;
+    white-space: nowrap;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .chip .dot{ width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .chip.active{
+    color: var(--ink);
+    border-color: currentColor;
+    background: rgba(255,255,255,0.04);
+  }
+
+  /* ---------- FEED ---------- */
+  main{
+    position: relative;
+    z-index: 1;
+    padding: 10px 18px 0;
+  }
+
+  .empty-state{
+    text-align: center;
+    padding: 70px 20px;
+    color: var(--ink-faint);
+  }
+  .empty-state .glyph{
+    margin-bottom: 14px;
+    opacity: 0.5;
+    display: flex;
+    justify-content: center;
+  }
+  .empty-state .glyph .icon-svg{ width: 34px; height: 34px; }
+  .empty-state p{ font-size: 0.85rem; max-width: 30ch; margin: 0 auto; }
+  .empty-state .hint{
+    margin-top: 14px;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--ink-faint);
+  }
+
+  .feed{
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    padding: 12px 0 20px;
+  }
+
+  .card{
+    background: var(--bg-card);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    overflow: hidden;
+    position: relative;
+  }
+
+  .card-media{
+    position: relative;
+    width: 100%;
+    aspect-ratio: 16/9;
+    background: var(--bg-elev);
+    overflow: hidden;
+  }
+  .card-media img{
+    width: 100%; height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+  .card-media .noimg{
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--ink-faint);
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    text-align: center;
+    padding: 20px;
+  }
+
+  .card-cat{
+    position: absolute;
+    top: 10px; left: 10px;
+    font-family: var(--font-mono);
+    font-size: 0.62rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 5px 9px;
+    border-radius: 999px;
+    background: rgba(10,12,15,0.72);
+    backdrop-filter: blur(6px);
+    color: var(--ink);
+    border: 1px solid rgba(255,255,255,0.12);
+    display: flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .card-cat .dot{ width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+
+  .card-type{
+    position: absolute;
+    top: 10px; right: 10px;
+    font-family: var(--font-mono);
+    font-size: 0.62rem;
+    letter-spacing: 0.03em;
+    padding: 5px 9px;
+    border-radius: 999px;
+    background: rgba(10,12,15,0.72);
+    backdrop-filter: blur(6px);
+    color: var(--ink);
+    border: 1px solid rgba(255,255,255,0.12);
+    display: flex;
+    align-items: center;
+    gap: 5px;
+  }
+
+  .icon-svg{
+    width: 12px;
+    height: 12px;
+    flex-shrink: 0;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .icon-svg.filled{ fill: currentColor; stroke: none; }
+  .card-cat .icon-svg{ width: 11px; height: 11px; color: currentColor; }
+  .card-source-row{ display:flex; align-items:center; gap:6px; margin-bottom: 6px; }
+  .card-source-row .icon-svg{ width: 12px; height: 12px; color: var(--ink-faint); }
+
+  .card-fallback-flag{
+    position: absolute;
+    bottom: 10px; left: 10px;
+    font-family: var(--font-mono);
+    font-size: 0.6rem;
+    letter-spacing: 0.02em;
+    padding: 4px 8px;
+    border-radius: 999px;
+    background: rgba(10,12,15,0.72);
+    backdrop-filter: blur(6px);
+    color: var(--ink-dim);
+    border: 1px solid rgba(255,255,255,0.12);
+  }
+
+  .card-body{
+    padding: 14px 16px 16px;
+  }
+
+  .card-source{
+    font-family: var(--font-mono);
+    font-size: 0.66rem;
+    color: var(--ink-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .card-post{
+    font-size: 0.92rem;
+    line-height: 1.55;
+    color: var(--ink);
+    white-space: pre-wrap;
+    margin-bottom: 6px;
+    max-height: 230px;
+    overflow: hidden;
+    position: relative;
+    -webkit-mask-image: linear-gradient(180deg, #000 75%, transparent 100%);
+            mask-image: linear-gradient(180deg, #000 75%, transparent 100%);
+  }
+  .card-post.expanded{
+    max-height: none;
+    -webkit-mask-image: none;
+            mask-image: none;
+  }
+  .card-post .headline{
+    font-weight: 700;
+    font-size: 1rem;
+    display: block;
+    margin-bottom: 6px;
+  }
+  .card-toggle{
+    background: none;
+    border: none;
+    color: var(--accent);
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    padding: 0;
+    margin-bottom: 12px;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .card-link{
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 0.76rem;
+    color: var(--ink-dim);
+    text-decoration: none;
+    border-bottom: 1px dashed var(--ink-faint);
+    padding-bottom: 1px;
+    margin-bottom: 14px;
+    word-break: break-all;
+  }
+
+  .card-actions{
+    display: flex;
+    gap: 8px;
+  }
+
+  .card-actions .btn{ flex: 1; }
+
+  .copied-flag{
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    color: var(--cat-manhwa);
+    text-align: center;
+    margin-top: 8px;
+    opacity: 0;
+    transition: opacity 0.2s ease;
+    height: 0;
+  }
+  .copied-flag.show{ opacity: 1; height: auto; margin-top: 8px; }
+
+  /* ---------- FOOTER / LOG ---------- */
+  .log-panel{
+    position: relative;
+    z-index: 1;
+    margin: 18px 18px 0;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--bg-elev);
+  }
+  .log-panel summary{
+    padding: 12px 14px;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--ink-faint);
+    cursor: pointer;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .log-panel summary::-webkit-details-marker{ display: none; }
+  .log-body{
+    padding: 0 14px 14px;
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    color: var(--ink-faint);
+    max-height: 160px;
+    overflow-y: auto;
+    border-top: 1px solid var(--line);
+    padding-top: 10px;
+  }
+  .log-body div{ padding: 2px 0; }
+  .log-body .err{ color: var(--cat-polemicas); }
+  .log-body .ok{ color: var(--cat-manhwa); }
+
+  footer.disclaimer{
+    position: relative;
+    z-index: 1;
+    padding: 18px;
+    text-align: center;
+    font-size: 0.68rem;
+    color: var(--ink-faint);
+    line-height: 1.6;
+  }
+
+  @media (min-width: 560px){
+    .feed{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+  }
+
+  /* ---------- SCHEDULE PANEL ---------- */
+  .schedule-panel{
+    position: relative;
+    z-index: 1;
+    margin: 4px 18px 0;
+  }
+  .schedule-toggle{
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: var(--bg-elev);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    padding: 12px 14px;
+    color: var(--ink);
+    font-family: var(--font-mono);
+    font-size: 0.76rem;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .schedule-toggle .arrow{ transition: transform 0.15s ease; color: var(--ink-faint); }
+  .schedule-toggle.open .arrow{ transform: rotate(180deg); }
+  .schedule-toggle .toggle-label{ display: flex; align-items: center; gap: 7px; text-align: left; }
+
+  .schedule-body{
+    display: none;
+    background: var(--bg-card);
+    border: 1px solid var(--line);
+    border-top: none;
+    border-radius: 0 0 var(--radius-sm) var(--radius-sm);
+    padding: 14px;
+  }
+  .schedule-body.open{ display: block; }
+
+  .schedule-now{
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--accent-soft);
+    border: 1px solid rgba(255,93,59,0.3);
+    border-radius: var(--radius-sm);
+    padding: 12px 14px;
+    margin-bottom: 14px;
+  }
+  .schedule-now .glyph{ display: flex; flex-shrink: 0; }
+  .schedule-now .glyph .icon-svg{ width: 20px; height: 20px; }
+  .schedule-now .txt{ font-size: 0.8rem; line-height: 1.4; }
+  .schedule-now .txt b{ color: var(--accent); }
+
+  .schedule-grid{
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .schedule-slot{
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    padding: 8px 10px;
+    border-radius: var(--radius-sm);
+    font-size: 0.78rem;
+  }
+  .schedule-slot.active{
+    background: rgba(255,93,59,0.1);
+    border: 1px solid rgba(255,93,59,0.25);
+  }
+  .schedule-slot .time{
+    font-family: var(--font-mono);
+    color: var(--ink-dim);
+    flex-shrink: 0;
+    width: 78px;
+  }
+  .schedule-slot .desc{ color: var(--ink); }
+  .schedule-slot .desc .type-tag{
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 2px;
+    font-family: var(--font-mono);
+    font-size: 0.66rem;
+    color: var(--ink-faint);
+  }
+  .type-tag-item{ display: inline-flex; align-items: center; gap: 4px; }
+  .type-tag-item .icon-svg{ width: 10px; height: 10px; }
+
+  .schedule-note{
+    margin-top: 12px;
+    font-size: 0.72rem;
+    color: var(--ink-faint);
+    line-height: 1.6;
+  }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="brand">
+    <span class="mark">Ota<span>Gen</span></span>
+    <span class="tag">MAL · AniList · RSS → Facebook</span>
+  </div>
+  <div class="status-line">
+    <span class="status-dot" id="statusDot"></span>
+    <span id="statusText">Listo para generar publicaciones</span>
+  </div>
+  <button class="fb-config-btn" id="fbConfigBtn">⚙️ Conectar mi página de Facebook</button>
+</header>
+
+<section class="controls">
+  <div class="controls-row">
+    <div class="count-field">
+      <label for="countInput">Publicaciones/día</label>
+      <input type="number" id="countInput" min="1" max="10" value="10">
+    </div>
+    <button class="btn btn-primary" id="generateBtn">Generar</button>
+  </div>
+  <div class="row-secondary">
+    <button class="btn btn-ghost btn-sm" id="clearBtn">Vaciar guardadas</button>
+    <button class="btn btn-ghost btn-sm" id="refreshFeedsBtn">Reintentar</button>
+  </div>
+</section>
+
+<div class="modal-overlay hidden" id="fbConfigModal">
+  <div class="modal-sheet">
+    <button class="modal-close" id="fbConfigClose"><svg class="icon-svg" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+    <h2>Conectar tu página de Facebook</h2>
+    <p>Con esto, el botón "Publicar en Facebook" publica directo en tu página con un clic, sin copiar/pegar. Inicia sesión con Facebook y el token permanente de tu página se obtiene automáticamente, sin pasar por el Graph API Explorer.</p>
+
+    <button class="btn btn-primary" id="fbOAuthBtn" style="width:100%; margin-bottom: 6px;">
+      <svg class="icon-svg" viewBox="0 0 24 24" style="width:16px;height:16px;vertical-align:-3px;margin-right:6px;" fill="currentColor" stroke="none"><path d="M22 12.06C22 6.51 17.52 2 12 2S2 6.51 2 12.06c0 5 3.66 9.15 8.44 9.94v-7.03H7.9v-2.9h2.54V9.85c0-2.5 1.49-3.89 3.78-3.89 1.1 0 2.24.2 2.24.2v2.46h-1.26c-1.24 0-1.63.77-1.63 1.56v1.87h2.78l-.44 2.9h-2.34V22c4.78-.79 8.44-4.94 8.44-9.94z"/></svg>
+      Iniciar sesión con Facebook
+    </button>
+    <div class="modal-test-result" id="fbOAuthResult"></div>
+
+    <div id="fbPageChooser" style="display:none; margin: 12px 0;">
+      <label style="display:block; font-family: var(--font-mono); font-size: 0.68rem; color: var(--ink-faint); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px;">Elige tu página</label>
+      <select id="fbPageSelect" style="width:100%; background: var(--bg-elev); border: 1px solid var(--line); border-radius: var(--radius-sm); color: var(--ink); font-family: var(--font-mono); font-size: 0.85rem; padding: 11px 12px;"></select>
+      <button class="btn btn-primary" id="fbPageChooseBtn" style="width:100%; margin-top: 10px;">Usar esta página</button>
+    </div>
+
+    <details class="token-converter">
+      <summary><svg class="icon-svg" viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>¿No funciona el login? Pegar token manualmente</summary>
+      <div class="token-converter-body">
+        <p class="tc-note">Alternativa manual, solo si el botón de arriba no funciona en tu caso: pega un token de página ya permanente (obtenido del Graph API Explorer + conversión) junto al ID de página.</p>
+        <div class="field">
+          <label for="fbPageIdInput">ID de tu página de Facebook</label>
+          <input type="text" id="fbPageIdInput" placeholder="Ej: 102938475610234" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="fbTokenInput">Token de acceso de la página</label>
+          <input type="password" id="fbTokenInput" placeholder="Pega aquí tu token permanente" autocomplete="off">
+        </div>
+        <div class="modal-actions">
+          <button class="btn btn-ghost" id="fbConfigTest" style="flex:1;">Probar conexión</button>
+          <button class="btn btn-primary" id="fbConfigSave" style="flex:1;">Guardar</button>
+        </div>
+        <div class="modal-test-result" id="fbConfigResult"></div>
+      </div>
+    </details>
+
+    <div class="modal-actions">
+      <button class="btn btn-ghost btn-sm" id="fbConfigDisconnect" style="flex:1;">Desconectar / borrar credenciales</button>
+    </div>
+  </div>
+</div>
+
+<nav class="filters" id="filterChips"></nav>
+
+<section class="schedule-panel" id="schedulePanel"></section>
+
+<main>
+  <div id="feedContainer"></div>
+</main>
+
+<details class="log-panel">
+  <summary>Registro de fuentes <span id="logCount">0</span></summary>
+  <div class="log-body" id="logBody"></div>
+</details>
+
+<footer class="disclaimer">
+  Con Facebook conectado, "Publicar automáticamente" envía la publicación directo a tu página vía API. Sin conexión, se copia el texto y abrimos Facebook para que lo pegues tú.
+</footer>
+
+<script>
+(function(){
+"use strict";
+
+/* =========================================================
+   CONFIG: categorías temáticas
+   (las keywords se usan solo para afinar contenido de RSS;
+   el contenido de Jikan/AniList ya trae categoría asignada)
+   ========================================================= */
+const CATEGORIES = {
+  "anime":            { label: "Anime",          color: "var(--cat-anime)",         kw: ["anime","episodio","temporada","estudio","opening","seiyuu","studio","arco"] },
+  "manga":             { label: "Manga",          color: "var(--cat-manga)",         kw: ["manga","mangaka","capítulo","tankobon","shonen jump","viz","kodansha","shueisha"] },
+  "manhwa":            { label: "Manhwa",         color: "var(--cat-manhwa)",        kw: ["manhwa","webtoon","corea","naver","kakao"] },
+  "videojuegos":       { label: "Videojuegos",    color: "var(--cat-videojuegos)",   kw: ["juego","videojuego","game","consola","playstation","xbox","nintendo","steam","dlc","gameplay"] },
+  "colaboraciones":    { label: "Colaboraciones", color: "var(--cat-colaboraciones)",kw: ["colaboración","collab","crossover","x ","team up"] },
+  "polemicas":         { label: "Polémicas",      color: "var(--cat-polemicas)",     kw: ["polémica","controversia","críticas","boicot","demanda","cancelad"] },
+  "adaptaciones":      { label: "Adaptaciones",   color: "var(--cat-adaptaciones)",  kw: ["adaptación","adapta","anunciada la serie","se convertirá"] },
+  "live-action":       { label: "Live action",    color: "var(--cat-liveaction)",    kw: ["live-action","live action","imagen real","película real","netflix live"] },
+  "curiosidades":      { label: "Curiosidades",   color: "var(--cat-curiosidades)",  kw: ["curiosidad","dato","sabías que","detrás de cámaras","easter egg"] },
+  "estrenos":          { label: "Estrenos",       color: "var(--cat-estrenos)",      kw: ["estreno","se estrena","llega el","fecha de lanzamiento","lanzamiento","debuta"] }
+};
+
+/* =========================================================
+   CONFIG: tipos de publicación (independiente de la categoría)
+   Esto controla cómo se redacta el texto, no de qué trata.
+   ========================================================= */
+const POST_TYPES = {
+  "noticia":   { label: "Noticia",   icon: "newspaper" },
+  "curiosidad":{ label: "Curiosidad",icon: "sparkles" },
+  "debate":    { label: "Debate",    icon: "chat" },
+  "ficha":     { label: "Ficha",     icon: "bookmark" }
+};
+
+/* =========================================================
+   ICONOS SVG (reemplazan emojis usados como marca/logo visual)
+   Set minimalista trazo 2px, hereda color vía currentColor.
+   ========================================================= */
+const SVG_ICONS = {
+  newspaper: `<svg class="icon-svg" viewBox="0 0 24 24"><path d="M4 4h13a2 2 0 0 1 2 2v13a1 1 0 0 1-1 1H6a2 2 0 0 1-2-2V4Z"/><path d="M19 8h1a1 1 0 0 1 1 1v9a2 2 0 0 1-2 2"/><line x1="7" y1="8" x2="14" y2="8"/><line x1="7" y1="12" x2="14" y2="12"/><line x1="7" y1="16" x2="12" y2="16"/></svg>`,
+  sparkles: `<svg class="icon-svg" viewBox="0 0 24 24"><path d="M12 3v4M12 17v4M3 12h4M17 12h4"/><path d="M12 8a4 4 0 0 0 4 4 4 4 0 0 0-4 4 4 4 0 0 0-4-4 4 4 0 0 0 4-4Z"/></svg>`,
+  chat: `<svg class="icon-svg" viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5Z"/></svg>`,
+  bookmark: `<svg class="icon-svg" viewBox="0 0 24 24"><path d="M19 21 12 16 5 21V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2Z"/></svg>`,
+  film: `<svg class="icon-svg" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="1"/><line x1="7" y1="4" x2="7" y2="20"/><line x1="17" y1="4" x2="17" y2="20"/><line x1="3" y1="9" x2="7" y2="9"/><line x1="3" y1="15" x2="7" y2="15"/><line x1="17" y1="9" x2="21" y2="9"/><line x1="17" y1="15" x2="21" y2="15"/></svg>`,
+  book: `<svg class="icon-svg" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z"/></svg>`,
+  layers: `<svg class="icon-svg" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>`,
+  gamepad: `<svg class="icon-svg" viewBox="0 0 24 24"><line x1="6" y1="12" x2="10" y2="12"/><line x1="8" y1="10" x2="8" y2="14"/><circle cx="15" cy="13" r="0.5" fill="currentColor" stroke="none"/><circle cx="18" cy="11" r="0.5" fill="currentColor" stroke="none"/><path d="M17.32 5H6.68a4 4 0 0 0-3.96 3.4l-1 6.5A3 3 0 0 0 4.68 18.5c.86 0 1.68-.34 2.3-.94L9 15.5h6l2.02 2.06a3.24 3.24 0 0 0 2.3.94 3 3 0 0 0 2.96-3.6l-1-6.5A4 4 0 0 0 17.32 5Z"/></svg>`,
+  handshake: `<svg class="icon-svg" viewBox="0 0 24 24"><path d="m11 17 2 2a1 1 0 1 0 3-3"/><path d="m14 14 2.5 2.5a1 1 0 1 0 3-3l-3.88-3.88a3 3 0 0 0-4.24 0l-.88.88a1 1 0 1 1-3-3l2.81-2.81a5.79 5.79 0 0 1 7.06-.87l.47.28a2 2 0 0 0 1.42.25L21 4"/><path d="m21 3 1 11h-2"/><path d="M3 3 2 14l6.5 6.5a1 1 0 1 0 3-3"/><path d="M3 4h8"/></svg>`,
+  alert: `<svg class="icon-svg" viewBox="0 0 24 24"><path d="m10.29 3.86-8.18 14.18A2 2 0 0 0 3.82 21h16.36a2 2 0 0 0 1.71-3.03L13.71 3.86a2 2 0 0 0-3.42 0Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>`,
+  refresh: `<svg class="icon-svg" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 15.3-6.4L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15.3 6.4L3 16"/><path d="M3 21v-5h5"/></svg>`,
+  clapper: `<svg class="icon-svg" viewBox="0 0 24 24"><path d="M20.2 6 3 11l-.9-2.4c-.3-1.1.3-2.2 1.3-2.5l13.5-4c1.1-.3 2.2.3 2.5 1.3Z"/><path d="M6.2 5.3 8 9.1M12.4 3.5l1.8 3.8"/><path d="M2 11h20v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2Z"/></svg>`,
+  rocket: `<svg class="icon-svg" viewBox="0 0 24 24"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/><path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"/></svg>`,
+  reddit: `<svg class="icon-svg" viewBox="0 0 24 24"><circle cx="12" cy="14" r="7"/><circle cx="8.5" cy="14" r="1" fill="currentColor" stroke="none"/><circle cx="15.5" cy="14" r="1" fill="currentColor" stroke="none"/><path d="M8.5 17c1 .8 2 1 3.5 1s2.5-.2 3.5-1"/><path d="M12 7V3.5"/><circle cx="12" cy="3" r="1" fill="currentColor" stroke="none"/><path d="M17 8.5c1 0 2 .6 2 1.8"/></svg>`,
+  link: `<svg class="icon-svg" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>`,
+  download: `<svg class="icon-svg" viewBox="0 0 24 24"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>`,
+  image: `<svg class="icon-svg" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="1.5" fill="currentColor" stroke="none"/><path d="m21 15-5-5L5 21"/></svg>`,
+  close: `<svg class="icon-svg" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`,
+  dotOn: `<svg class="icon-svg filled" viewBox="0 0 24 24" style="color:#3ddc84"><circle cx="12" cy="12" r="7"/></svg>`,
+  dotOff: `<svg class="icon-svg filled" viewBox="0 0 24 24" style="color:#ff5c7a"><circle cx="12" cy="12" r="7"/></svg>`,
+  calendar: `<svg class="icon-svg" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>`,
+  lock: `<svg class="icon-svg" viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>`
+};
+function svgIcon(key){ return SVG_ICONS[key] || SVG_ICONS.sparkles; }
+
+// Plantillas de debate/encuesta: se rellenan con un título real (de Jikan/AniList),
+// nunca inventan datos, solo formulan una pregunta de opinión sobre algo que existe.
+const DEBATE_TEMPLATES = [
+  (t) => `¿${t} está sobrevalorado o merece todo el hype que tiene? Defiende tu postura 👇`,
+  (t) => `Team ${t} o team "prefiero cualquier otra cosa"? Cuéntanos por qué en los comentarios 👇`,
+  (t) => `Si tuvieras que recomendar ${t} a alguien que nunca vio anime/manga, ¿lo harías? ¿Por qué sí o por qué no?`,
+  (t) => `¿${t} tiene el mejor arco de su género o hay algo que lo supere? Debate abierto 🔥`,
+  (t) => `Sinceramente: ¿${t} envejeció bien o se quedó atrás con el tiempo?`,
+  (t) => `¿Creen que ${t} merece una segunda temporada / continuación? Argumenten 👇`,
+  (t) => `¿${t} es de los que se ven una vez y ya, o de los que revisitas cada año?`,
+  (t) => `Del 1 al 10, ¿cuánto le pones a ${t}? Justifica tu nota 👇`,
+  (t) => `¿${t} tiene el final que se merecía o lo arruinaron? Sin spoilers en los comentarios por favor 🙏`,
+  (t) => `¿Qué personaje de ${t} se llevó todo el protagonismo sin ser el protagonista?`,
+  (t) => `¿${t} es de esos títulos que todos dicen que hay que ver, o está sobrevalorado por el hype?`,
+  (t) => `Si pudieras cambiar UNA cosa de ${t}, ¿qué sería?`
+];
+
+/* =========================================================
+   CONFIG: fuentes de datos
+   ========================================================= */
+
+// --- APIs estructuradas (CORS abierto, sin proxy, sin key) ---
+const JIKAN_BASE = "https://api.jikan.moe/v4";
+const ANILIST_ENDPOINT = "https://graphql.anilist.co";
+
+// --- RSS de anime/manga/videojuegos/cultura otaku (necesitan proxy CORS) ---
+// Ampliado para dar más variedad de fuentes y mejor cobertura de categorías
+// que Jikan/AniList no cubren bien por sí solas: colaboraciones, polémicas,
+// live-action, curiosidades editoriales.
+const RSS_FEEDS = [
+  { name: "IGN",             url: "https://feeds.ign.com/ign/all",              baseCats: ["videojuegos","anime","live-action"], icon: "newspaper" },
+  { name: "Siliconera",      url: "https://www.siliconera.com/feed/",           baseCats: ["videojuegos","anime","manga"], icon: "newspaper" },
+  { name: "PC Gamer",        url: "https://www.pcgamer.com/rss/",               baseCats: ["videojuegos"], icon: "gamepad" },
+  { name: "Crunchyroll News",url: "https://www.crunchyroll.com/newsrss",        baseCats: ["anime","estrenos","adaptaciones"], icon: "film" },
+  { name: "Anime News Network", url: "https://www.animenewsnetwork.com/all/rss.xml", baseCats: ["anime","manga","polemicas","colaboraciones"], icon: "newspaper" },
+  { name: "Kotaku",          url: "https://kotaku.com/rss",                     baseCats: ["videojuegos","polemicas","curiosidades"], icon: "gamepad" },
+  { name: "Polygon",         url: "https://www.polygon.com/rss/index.xml",      baseCats: ["videojuegos","live-action","adaptaciones"], icon: "gamepad" },
+  { name: "CBR Anime",       url: "https://www.cbr.com/feed/category/anime/",   baseCats: ["anime","manga","curiosidades","colaboraciones"], icon: "book" },
+  { name: "ComicBook Anime", url: "https://comicbook.com/anime/feed/",          baseCats: ["anime","manga","estrenos","polemicas"], icon: "book" },
+  { name: "Anime Trending",  url: "https://www.animetrending.com/feed/",        baseCats: ["anime","estrenos","curiosidades"], icon: "film" },
+  { name: "Otaku USA",       url: "https://otakuusamagazine.com/feed/",         baseCats: ["anime","manga","curiosidades"], icon: "newspaper" },
+  { name: "Screen Rant Anime", url: "https://screenrant.com/feed/anime/",       baseCats: ["anime","live-action","polemicas"], icon: "clapper" },
+  { name: "GamesRadar",      url: "https://www.gamesradar.com/rss/",            baseCats: ["videojuegos","adaptaciones"], icon: "gamepad" },
+  { name: "Eurogamer",       url: "https://www.eurogamer.net/feed",             baseCats: ["videojuegos"], icon: "gamepad" }
+];
+
+// --- Reddit: comunidades reales vía RSS público (sin key, vía el mismo proxy CORS) ---
+// Cada entrada representa hilos activos de una comunidad de fans, no una nota editorial:
+// se procesan como contenido de comunidad (postType "debate"/"curiosidad") en vez de "noticia".
+const REDDIT_FEEDS = [
+  { name: "r/anime",       url: "https://www.reddit.com/r/anime/top/.rss?t=day",       baseCats: ["anime"] },
+  { name: "r/manga",       url: "https://www.reddit.com/r/manga/top/.rss?t=day",       baseCats: ["manga"] },
+  { name: "r/manhwa",      url: "https://www.reddit.com/r/manhwa/top/.rss?t=day",      baseCats: ["manhwa"] },
+  { name: "r/anime_irl",   url: "https://www.reddit.com/r/anime_irl/top/.rss?t=day",   baseCats: ["curiosidades"] },
+  { name: "r/gaming",      url: "https://www.reddit.com/r/gaming/top/.rss?t=day",      baseCats: ["videojuegos"] },
+  { name: "r/AnimeFunny",  url: "https://www.reddit.com/r/Animemes/top/.rss?t=day",    baseCats: ["curiosidades"] }
+];
+
+const CORS_PROXY = "https://api.allorigins.win/raw?url=";
+
+const STORAGE_KEY_POSTS = "otagen_posts_v3";
+const STORAGE_KEY_SEEN  = "otagen_seen_ids_v3";
+const STORAGE_KEY_FB_CREDS = "otagen_fb_creds_v1";
+const GRAPH_API_VERSION = "v21.0";
+
+
+/* =========================================================
+   STATE
+   ========================================================= */
+let allPosts = [];
+let seenIds = new Set();
+let activeFilter = "all";
+let logEntries = [];
+let fbCreds = { pageId: "", token: "" }; // credenciales de Graph API, si el usuario las conectó
+
+/* =========================================================
+   DOM refs
+   ========================================================= */
+const $ = (id) => document.getElementById(id);
+const statusDot   = $("statusDot");
+const statusText  = $("statusText");
+const countInput  = $("countInput");
+const generateBtn = $("generateBtn");
+const clearBtn    = $("clearBtn");
+const refreshBtn  = $("refreshFeedsBtn");
+const feedContainer = $("feedContainer");
+const filterChips = $("filterChips");
+const logBody = $("logBody");
+const logCount = $("logCount");
+const fbConfigBtn = $("fbConfigBtn");
+const fbConfigModal = $("fbConfigModal");
+const fbConfigClose = $("fbConfigClose");
+const fbPageIdInput = $("fbPageIdInput");
+const fbTokenInput = $("fbTokenInput");
+const fbConfigTest = $("fbConfigTest");
+const fbConfigSave = $("fbConfigSave");
+const fbConfigDisconnect = $("fbConfigDisconnect");
+const fbConfigResult = $("fbConfigResult");
+const fbOAuthBtn = $("fbOAuthBtn");
+const fbOAuthResult = $("fbOAuthResult");
+const fbPageChooser = $("fbPageChooser");
+const fbPageSelect = $("fbPageSelect");
+const fbPageChooseBtn = $("fbPageChooseBtn");
+
+/* =========================================================
+   INIT
+   ========================================================= */
+function init(){
+  loadFromStorage();
+  loadFbCreds();
+  buildFilterChips();
+  renderFeed();
+  renderSchedulePanel();
+  generateBtn.addEventListener("click", onGenerateClick);
+  clearBtn.addEventListener("click", onClearClick);
+  refreshBtn.addEventListener("click", onGenerateClick);
+  fbConfigBtn.addEventListener("click", openFbConfigModal);
+  fbConfigClose.addEventListener("click", closeFbConfigModal);
+  fbConfigTest.addEventListener("click", onFbConfigTest);
+  fbConfigSave.addEventListener("click", onFbConfigSave);
+  fbConfigDisconnect.addEventListener("click", onFbConfigDisconnect);
+  fbOAuthBtn.addEventListener("click", onFbOAuthClick);
+  fbPageChooseBtn.addEventListener("click", onFbPageChoose);
+  window.addEventListener("message", onFbAuthMessage);
+  updateFbConfigButtonState();
+}
+
+/* =========================================================
+   STORAGE
+   ========================================================= */
+function loadFromStorage(){
+  try{
+    const rawPosts = localStorage.getItem(STORAGE_KEY_POSTS);
+    allPosts = rawPosts ? JSON.parse(rawPosts) : [];
+  }catch(e){ allPosts = []; }
+
+  try{
+    const rawSeen = localStorage.getItem(STORAGE_KEY_SEEN);
+    const arr = rawSeen ? JSON.parse(rawSeen) : [];
+    seenIds = new Set(arr);
+  }catch(e){ seenIds = new Set(); }
+}
+
+function saveToStorage(){
+  localStorage.setItem(STORAGE_KEY_POSTS, JSON.stringify(allPosts));
+  localStorage.setItem(STORAGE_KEY_SEEN, JSON.stringify(Array.from(seenIds)));
+}
+
+/* =========================================================
+   CONEXIÓN A FACEBOOK (Graph API)
+   ========================================================= */
+function loadFbCreds(){
+  try{
+    const raw = localStorage.getItem(STORAGE_KEY_FB_CREDS);
+    fbCreds = raw ? JSON.parse(raw) : { pageId: "", token: "" };
+  }catch(e){ fbCreds = { pageId: "", token: "" }; }
+}
+
+function saveFbCreds(){
+  localStorage.setItem(STORAGE_KEY_FB_CREDS, JSON.stringify(fbCreds));
+}
+
+function isFbConnected(){
+  return !!(fbCreds.pageId && fbCreds.token);
+}
+
+function updateFbConfigButtonState(){
+  if (isFbConnected()){
+    fbConfigBtn.textContent = "✅ Página de Facebook conectada";
+    fbConfigBtn.classList.add("connected");
+  } else {
+    fbConfigBtn.textContent = "⚙️ Conectar mi página de Facebook";
+    fbConfigBtn.classList.remove("connected");
+  }
+}
+
+function openFbConfigModal(){
+  fbPageIdInput.value = fbCreds.pageId || "";
+  fbTokenInput.value = fbCreds.token || "";
+  fbConfigResult.textContent = "";
+  fbConfigResult.className = "modal-test-result";
+  fbOAuthResult.textContent = "";
+  fbOAuthResult.className = "modal-test-result";
+  fbPageChooser.style.display = "none";
+  fbPageSelect.innerHTML = "";
+  fbOAuthBtn.disabled = false;
+  fbOAuthBtn.textContent = "Iniciar sesión con Facebook";
+  fbConfigModal.classList.remove("hidden");
+}
+
+function closeFbConfigModal(){
+  fbConfigModal.classList.add("hidden");
+}
+
+async function onFbConfigTest(){
+  const pageId = fbPageIdInput.value.trim();
+  const token = fbTokenInput.value.trim();
+  if (!pageId || !token){
+    fbConfigResult.textContent = "Completa el ID de página y el token antes de probar.";
+    fbConfigResult.className = "modal-test-result err";
+    return;
+  }
+  fbConfigResult.textContent = "Probando conexión…";
+  fbConfigResult.className = "modal-test-result";
+  try{
+    const url = `https://graph.facebook.com/${GRAPH_API_VERSION}/${encodeURIComponent(pageId)}?fields=name&access_token=${encodeURIComponent(token)}`;
+    const res = await fetch(url);
+    const json = await res.json();
+    if (!res.ok || json.error){
+      throw new Error(json.error?.message || ("HTTP " + res.status));
+    }
+    fbConfigResult.textContent = `Conexión exitosa: página "${json.name}" ✓`;
+    fbConfigResult.className = "modal-test-result ok";
+  }catch(e){
+    fbConfigResult.textContent = "Error: " + (e.message || e);
+    fbConfigResult.className = "modal-test-result err";
+  }
+}
+
+// ---------------------------------------------------------------------
+// LOGIN REAL CON FACEBOOK (OAuth) — reemplaza el flujo manual del Explorer.
+//
+// 1) Abrimos un popup a la pantalla de autorización oficial de Facebook.
+// 2) El usuario acepta los permisos ahí mismo, en facebook.com.
+// 3) Facebook redirige el popup a nuestra Netlify Function (fb-auth), que
+//    hace en el servidor el intercambio código -> token de usuario ->
+//    token de usuario de larga duración -> token de PÁGINA permanente
+//    (usando el App Secret, que nunca toca el navegador).
+// 4) La function le manda el resultado a esta pestaña vía postMessage y
+//    el popup se cierra solo.
+// ---------------------------------------------------------------------
+
+// ID pública de la app de Facebook (esto SÍ puede ir en el frontend, solo
+// el App Secret debe quedarse en el servidor). Configúralo con tu App ID.
+const FB_OAUTH_APP_ID = "4065754450395443";
+// Debe coincidir EXACTO con FB_REDIRECT_URI en las variables de entorno de
+// Netlify y con la URI registrada en Facebook Developers > Facebook Login > Settings.
+const FB_OAUTH_REDIRECT_URI = "https://generadordepubli.netlify.app/.netlify/functions/fb-auth";
+const FB_OAUTH_SCOPES = "pages_manage_posts,pages_read_engagement,pages_show_list";
+
+let fbOAuthPopup = null;
+let fbOAuthPages = [];
+
+function onFbOAuthClick(){
+  if (FB_OAUTH_APP_ID === "TU_APP_ID_AQUI"){
+    fbOAuthResult.textContent = "Falta configurar el App ID de Facebook en el código (FB_OAUTH_APP_ID).";
+    fbOAuthResult.className = "modal-test-result err";
+    return;
+  }
+
+  const authUrl = `https://www.facebook.com/${GRAPH_API_VERSION}/dialog/oauth?`
+    + `client_id=${encodeURIComponent(FB_OAUTH_APP_ID)}`
+    + `&redirect_uri=${encodeURIComponent(FB_OAUTH_REDIRECT_URI)}`
+    + `&scope=${encodeURIComponent(FB_OAUTH_SCOPES)}`
+    + `&response_type=code`;
+
+  fbOAuthResult.textContent = "Abriendo la ventana de Facebook…";
+  fbOAuthResult.className = "modal-test-result";
+  fbOAuthBtn.disabled = true;
+
+  const w = 560, h = 640;
+  const left = window.screenX + (window.outerWidth - w) / 2;
+  const top = window.screenY + (window.outerHeight - h) / 2;
+  fbOAuthPopup = window.open(
+    authUrl,
+    "fb-oauth-login",
+    `width=${w},height=${h},left=${left},top=${top},toolbar=no,menubar=no`
+  );
+
+  if (!fbOAuthPopup){
+    fbOAuthResult.textContent = "El navegador bloqueó la ventana emergente. Permite popups para este sitio e inténtalo de nuevo.";
+    fbOAuthResult.className = "modal-test-result err";
+    fbOAuthBtn.disabled = false;
+  }
+}
+
+// Recibe el resultado que manda la Netlify Function (fb-auth.js) desde el popup.
+function onFbAuthMessage(event){
+  const data = event.data;
+  if (!data || data.source !== "otagen-fb-auth") return;
+
+  fbOAuthBtn.disabled = false;
+  const payload = data.payload || {};
+
+  if (!payload.ok){
+    fbOAuthResult.textContent = "Error: " + (payload.message || "no se pudo completar el login.");
+    fbOAuthResult.className = "modal-test-result err";
+    return;
+  }
+
+  fbOAuthPages = payload.pages || [];
+
+  if (fbOAuthPages.length === 1){
+    applyChosenPage(fbOAuthPages[0]);
+    return;
+  }
+
+  // Varias páginas administradas por esta cuenta: que el usuario elija.
+  fbPageSelect.innerHTML = fbOAuthPages
+    .map((p, i) => `<option value="${i}">${escapeHtml(p.name)}</option>`)
+    .join("");
+  fbPageChooser.style.display = "block";
+  fbOAuthResult.textContent = `Se encontraron ${fbOAuthPages.length} páginas. Elige con cuál publicar.`;
+  fbOAuthResult.className = "modal-test-result ok";
+}
+
+function onFbPageChoose(){
+  const idx = parseInt(fbPageSelect.value, 10);
+  const chosen = fbOAuthPages[idx];
+  if (chosen) applyChosenPage(chosen);
+}
+
+function applyChosenPage(page){
+  fbCreds = { pageId: String(page.id), token: page.access_token };
+  saveFbCreds();
+  updateFbConfigButtonState();
+  renderFeed();
+  fbPageIdInput.value = fbCreds.pageId;
+  fbTokenInput.value = fbCreds.token;
+  fbPageChooser.style.display = "none";
+  fbOAuthResult.textContent = `Conectado a "${page.name}" ✓ Token permanente obtenido automáticamente.`;
+  fbOAuthResult.className = "modal-test-result ok";
+  setTimeout(closeFbConfigModal, 1200);
+}
+
+function onFbConfigSave(){
+  const pageId = fbPageIdInput.value.trim();
+  const token = fbTokenInput.value.trim();
+  if (!pageId || !token){
+    fbConfigResult.textContent = "Completa ambos campos antes de guardar.";
+    fbConfigResult.className = "modal-test-result err";
+    return;
+  }
+  fbCreds = { pageId, token };
+  saveFbCreds();
+  updateFbConfigButtonState();
+  renderFeed();
+  fbConfigResult.textContent = "Credenciales guardadas ✓";
+  fbConfigResult.className = "modal-test-result ok";
+  setTimeout(closeFbConfigModal, 900);
+}
+
+function onFbConfigDisconnect(){
+  if (!confirm("¿Borrar las credenciales guardadas de Facebook? Volverás al modo copiar + abrir Facebook.")) return;
+  fbCreds = { pageId: "", token: "" };
+  saveFbCreds();
+  updateFbConfigButtonState();
+  renderFeed();
+  fbPageIdInput.value = "";
+  fbTokenInput.value = "";
+  fbConfigResult.textContent = "Credenciales borradas.";
+  fbConfigResult.className = "modal-test-result";
+}
+
+// Publica directamente en la página de Facebook usando Graph API.
+// Si el post tiene imagen, se publica en /photos (con el link y el texto como
+// caption); si no, se publica en /feed como texto + link.
+async function publishToFacebookGraph(p){
+  const base = `https://graph.facebook.com/${GRAPH_API_VERSION}/${encodeURIComponent(fbCreds.pageId)}`;
+  const message = p.postText + (p.link ? `\n\n${p.link}` : "");
+
+  if (p.image){
+    const url = `${base}/photos`;
+    const body = new URLSearchParams({
+      url: p.image,
+      caption: message,
+      access_token: fbCreds.token
+    });
+    const res = await fetch(url, { method: "POST", body });
+    const json = await res.json();
+    if (!res.ok || json.error) throw new Error(json.error?.message || ("HTTP " + res.status));
+    return json;
+  } else {
+    const url = `${base}/feed`;
+    const body = new URLSearchParams({
+      message,
+      link: p.link || "",
+      access_token: fbCreds.token
+    });
+    const res = await fetch(url, { method: "POST", body });
+    const json = await res.json();
+    if (!res.ok || json.error) throw new Error(json.error?.message || ("HTTP " + res.status));
+    return json;
+  }
+}
+
+/* =========================================================
+   STATUS / LOG helpers
+   ========================================================= */
+function setStatus(text, mode){
+  statusText.textContent = text;
+  statusDot.className = "status-dot" + (mode ? " " + mode : "");
+}
+
+function log(msg, kind){
+  logEntries.unshift({ msg, kind, t: new Date() });
+  logEntries = logEntries.slice(0, 80);
+  renderLog();
+}
+
+function renderLog(){
+  logCount.textContent = logEntries.length;
+  logBody.innerHTML = logEntries.map(e => {
+    const time = e.t.toLocaleTimeString();
+    const cls = e.kind === "err" ? "err" : (e.kind === "ok" ? "ok" : "");
+    return `<div class="${cls}">[${time}] ${escapeHtml(e.msg)}</div>`;
+  }).join("");
+}
+
+/* =========================================================
+   CALENDARIO RECOMENDADO DE PUBLICACIÓN
+   Basado en mejores prácticas generales de Facebook para páginas de
+   entretenimiento/fandom (anime, manga, manhwa, videojuegos):
+   - Picos de actividad entre semana: mediodía (pausa de almuerzo) y
+     noche (después de cenar, 20:00–23:00).
+   - Fines de semana: la audiencia entra más tarde en la mañana y se
+     mantiene activa toda la tarde.
+   - Contenido "ligero" (curiosidades, fichas) rinde mejor en horas de
+     baja atención (mañana, mediodía); el contenido que genera discusión
+     (debates, polémicas) rinde mejor en horas pico donde hay más gente
+     conectada simultáneamente para comentar.
+   Esto es una guía general, no una garantía: los Insights de tu propia
+   página (Meta Business Suite) siempre van a ser más precisos con el
+   tiempo, una vez tengas datos propios acumulados.
+   ========================================================= */
+const SCHEDULE_WEEKDAY = [
+  { start: 7,  end: 9,  label: "Buenos días / camino al trabajo-escuela", types: ["curiosidad", "ficha"] },
+  { start: 9,  end: 12, label: "Zona muerta — evitar si puedes",          types: [] },
+  { start: 12, end: 14, label: "Pico de almuerzo 🔥",                      types: ["noticia", "curiosidad", "ficha"] },
+  { start: 14, end: 18, label: "Tarde tranquila",                          types: ["ficha", "curiosidad"] },
+  { start: 18, end: 20, label: "Salida del trabajo/escuela, calentando",   types: ["noticia", "ficha"] },
+  { start: 20, end: 23, label: "Pico de la noche 🔥🔥 (el mejor momento)",  types: ["debate", "noticia", "estrenos"] },
+  { start: 23, end: 24, label: "Público trasnochador, buen engagement",   types: ["debate", "curiosidad"] },
+  { start: 0,  end: 7,  label: "Zona muerta — no publicar",                types: [] }
+];
+
+const SCHEDULE_WEEKEND = [
+  { start: 8,  end: 11, label: "Mañana relajada de finde",                types: ["curiosidad", "ficha"] },
+  { start: 11, end: 14, label: "Pico de mediodía 🔥",                      types: ["noticia", "ficha", "debate"] },
+  { start: 14, end: 19, label: "Tarde de finde, mucha gente conectada",   types: ["debate", "noticia", "ficha"] },
+  { start: 19, end: 23, label: "Pico de la noche 🔥🔥 (el mejor momento)",  types: ["debate", "estrenos", "noticia"] },
+  { start: 23, end: 24, label: "Trasnochadores del finde",                types: ["debate", "curiosidad"] },
+  { start: 0,  end: 8,  label: "Zona muerta — no publicar",                types: [] }
+];
+
+function getScheduleForNow(){
+  const now = new Date();
+  const day = now.getDay(); // 0=domingo, 6=sábado
+  const hour = now.getHours();
+  const isWeekend = (day === 0 || day === 6);
+  const table = isWeekend ? SCHEDULE_WEEKEND : SCHEDULE_WEEKDAY;
+  const slot = table.find(s => hour >= s.start && hour < s.end) || table[table.length - 1];
+  return { table, slot, isWeekend, hour };
+}
+
+function scheduleAdviceText(slot){
+  if (!slot.types.length){
+    return "No es un buen horario para publicar ahora mismo. Guarda tus publicaciones generadas y prográmalas para el siguiente pico.";
+  }
+  const typeLabels = slot.types.map(t => (POST_TYPES[t] || {label:t}).label);
+  return `Es buen momento para publicar. Prioriza: ${typeLabels.join(", ")}.`;
+}
+
+function renderSchedulePanel(){
+  const panel = $("schedulePanel");
+  const { table, slot, isWeekend } = getScheduleForNow();
+
+  const rows = table.map(s => {
+    const isActive = s === slot;
+    const timeLabel = `${String(s.start).padStart(2,"0")}:00–${String(s.end).padStart(2,"0")}:00`;
+    const typesLabel = s.types.length
+      ? s.types.map(t => `<span class="type-tag-item">${svgIcon((POST_TYPES[t]||{}).icon || "sparkles")}${(POST_TYPES[t]||{label:t}).label}</span>`).join("")
+      : "Evitar publicar";
+    return `
+      <div class="schedule-slot ${isActive ? "active" : ""}">
+        <span class="time">${timeLabel}</span>
+        <span class="desc">${s.label}<br><span class="type-tag">${typesLabel}</span></span>
+      </div>`;
+  }).join("");
+
+  panel.innerHTML = `
+    <button class="schedule-toggle" id="scheduleToggleBtn">
+      <span class="toggle-label">${svgIcon("calendar")}Mejor hora para publicar hoy (${isWeekend ? "fin de semana" : "entre semana"})</span>
+      <span class="arrow">▾</span>
+    </button>
+    <div class="schedule-body" id="scheduleBody">
+      <div class="schedule-now">
+        <span class="glyph">${slot.types.length ? svgIcon("dotOn") : svgIcon("dotOff")}</span>
+        <span class="txt">${scheduleAdviceText(slot)}</span>
+      </div>
+      <div class="schedule-grid">${rows}</div>
+      <div class="schedule-note">
+        Calendario basado en patrones generales de páginas de anime/manga/videojuegos en Facebook.
+        Con el tiempo, revisa los Insights de tu página (Meta Business Suite) para afinar estos horarios con datos reales de tu audiencia.
+      </div>
+    </div>
+  `;
+
+  const toggleBtn = $("scheduleToggleBtn");
+  const body = $("scheduleBody");
+  toggleBtn.addEventListener("click", () => {
+    toggleBtn.classList.toggle("open");
+    body.classList.toggle("open");
+  });
+}
+
+/* =========================================================
+   FILTER CHIPS
+   ========================================================= */
+function buildFilterChips(){
+  const chips = [{ key: "all", label: "Todo", color: "var(--ink-dim)" }];
+  Object.keys(CATEGORIES).forEach(k => {
+    chips.push({ key: k, label: CATEGORIES[k].label, color: CATEGORIES[k].color });
+  });
+
+  filterChips.innerHTML = chips.map(c => `
+    <button class="chip ${c.key===activeFilter?'active':''}" data-key="${c.key}" style="color:${c.key==='all'?'var(--ink-dim)':c.color}">
+      ${c.key !== 'all' ? `<span class="dot"></span>` : ''}${c.label}
+    </button>
+  `).join("");
+
+  Array.from(filterChips.querySelectorAll(".chip")).forEach(btn => {
+    btn.addEventListener("click", () => {
+      activeFilter = btn.dataset.key;
+      buildFilterChips();
+      renderFeed();
+    });
+  });
+}
+
+/* =========================================================
+   GENERATE FLOW
+   ========================================================= */
+async function onGenerateClick(){
+  const wanted = clampCount(parseInt(countInput.value, 10) || 10);
+  countInput.value = wanted;
+
+  generateBtn.disabled = true;
+  refreshBtn.disabled = true;
+  setStatus("Buscando contenido en varias fuentes…", "busy");
+  logEntries = [];
+  renderLog();
+
+  let candidates = [];
+
+  // --- 1) Jikan: anime en emisión, últimos añadidos, próximos estrenos ---
+  candidates = candidates.concat(await safeFetchGroup("Jikan · temporada actual", () => fetchJikanSeasonNow()));
+  candidates = candidates.concat(await safeFetchGroup("Jikan · próximos estrenos", () => fetchJikanSeasonUpcoming()));
+  candidates = candidates.concat(await safeFetchGroup("Jikan · manga top", () => fetchJikanTopManga()));
+  candidates = candidates.concat(await safeFetchGroup("Jikan · curiosidad random (anime)", () => fetchJikanRandomAnime()));
+  candidates = candidates.concat(await safeFetchGroup("Jikan · curiosidad random (manga)", () => fetchJikanRandomManga()));
+  candidates = candidates.concat(await safeFetchGroup("Jikan · personajes populares", () => fetchJikanTopCharacters()));
+
+  // --- 2) AniList: manhwa (origen coreano) trending y próximos ---
+  candidates = candidates.concat(await safeFetchGroup("AniList · manhwa trending", () => fetchAniListManhwa()));
+  candidates = candidates.concat(await safeFetchGroup("AniList · anime trending", () => fetchAniListTrendingAnime()));
+
+  // --- 3) Debates/encuestas: usan títulos reales de MAL top, sin inventar datos ---
+  candidates = candidates.concat(await safeFetchGroup("Debates de la comunidad", () => fetchDebateTopics()));
+
+  // --- 4) RSS: videojuegos y noticias generales (vía proxy) ---
+  for (const feed of RSS_FEEDS){
+    candidates = candidates.concat(await safeFetchGroup(feed.name, () => fetchRssFeed(feed)));
+  }
+
+  // --- 5) Reddit: comunidades reales de fans (hilos del día, vía proxy) ---
+  for (const feed of REDDIT_FEEDS){
+    candidates = candidates.concat(await safeFetchGroup(feed.name, () => fetchRedditFeed(feed)));
+  }
+
+  // quitar ya vistas y sin datos mínimos
+  candidates = candidates.filter(c => c.title && c.link && !seenIds.has(c.uid));
+
+  // quitar duplicados entre sí (mismo uid)
+  const uniqueMap = new Map();
+  candidates.forEach(c => { if (!uniqueMap.has(c.uid)) uniqueMap.set(c.uid, c); });
+  candidates = Array.from(uniqueMap.values());
+
+  // Etiquetar ícono/tipo de fuente para las que no lo traen ya asignado
+  // (RSS y Reddit ya vienen marcados desde su propio fetcher).
+  candidates.forEach(c => {
+    if (c.sourceIcon) return;
+    if (c.uid.startsWith("mal-")) { c.sourceIcon = "bookmark"; c.sourceKind = "database"; }
+    else if (c.uid.startsWith("anilist-")) { c.sourceIcon = "layers"; c.sourceKind = "database"; }
+    else if (c.uid.startsWith("debate-")) { c.sourceIcon = "chat"; c.sourceKind = "community"; }
+    else { c.sourceIcon = "newspaper"; c.sourceKind = "media"; }
+  });
+
+  if (candidates.length === 0){
+    setStatus("No hay contenido nuevo disponible ahora mismo", "err");
+    generateBtn.disabled = false;
+    refreshBtn.disabled = false;
+    return;
+  }
+
+  shuffle(candidates);
+
+  // intentar variar categorías: no repetir la misma categoría más de lo necesario
+  const chosen = pickDiverse(candidates, wanted);
+
+  // Resolver imágenes faltantes ANTES de construir los posts finales:
+  // 1) buscar una imagen real relacionada al título (Jikan/AniList)
+  // 2) si no aparece nada, usar la imagen genérica de la categoría
+  setStatus("Verificando imágenes de portada…", "busy");
+  await Promise.all(chosen.map(async (item) => {
+    if (item.image) return;
+    const found = await findFallbackImageForTitle(item.title);
+    item.image = found || FALLBACK_IMAGE_BY_CAT[item.category] || FALLBACK_IMAGE_BY_CAT["anime"];
+    item.imageIsFallback = true;
+  }));
+
+  const newPosts = chosen.map(item => buildPost(item));
+
+  newPosts.forEach(p => seenIds.add(p.uid));
+  allPosts = newPosts.concat(allPosts);
+
+  saveToStorage();
+  renderFeed();
+
+  if (newPosts.length < wanted){
+    setStatus(`Generadas ${newPosts.length} de ${wanted} solicitadas (pocas novedades nuevas ahora)`, "ok");
+  } else {
+    setStatus(`${newPosts.length} publicaciones generadas`, "ok");
+  }
+
+  generateBtn.disabled = false;
+  refreshBtn.disabled = false;
+}
+
+async function safeFetchGroup(label, fn){
+  try{
+    const items = await fn();
+    log(`${label}: ${items.length} elementos`, "ok");
+    return items;
+  }catch(err){
+    log(`${label}: fallo (${err.message || err})`, "err");
+    return [];
+  }
+}
+
+function onClearClick(){
+  if (!confirm("¿Vaciar todas las publicaciones guardadas? Esto no borra el historial anti-duplicados.")) return;
+  allPosts = [];
+  saveToStorage();
+  renderFeed();
+  setStatus("Publicaciones guardadas vaciadas", "ok");
+}
+
+function clampCount(n){
+  if (n < 1) return 1;
+  if (n > 10) return 10;
+  return n;
+}
+
+// Elige `n` candidatos maximizando variedad real: alterna primero por tipo de
+// fuente (medio editorial / comunidad Reddit / base de datos MAL-AniList),
+// y dentro de cada bucket por tipo de publicación (noticia/curiosidad/debate/
+// ficha), para que 5 publicaciones nunca salgan todas del mismo lugar.
+function pickDiverse(list, n){
+  const buckets = {};
+  list.forEach(item => {
+    const kind = item.sourceKind || "media";
+    const type = item.postType || "noticia";
+    const key = kind + "::" + type;
+    if (!buckets[key]) buckets[key] = [];
+    buckets[key].push(item);
+  });
+  Object.values(buckets).forEach(bucket => shuffle(bucket));
+
+  // También evita repetir la misma fuente exacta (ej. "r/anime") demasiadas
+  // veces seguidas dentro de un mismo bucket, sin descartar candidatos.
+  const usedSources = new Set();
+  const keys = shuffle(Object.keys(buckets));
+  const result = [];
+  let idx = 0;
+  let stalledPasses = 0;
+  while (result.length < n && keys.some(k => buckets[k].length > 0) && stalledPasses < keys.length * 2){
+    const key = keys[idx % keys.length];
+    const bucket = buckets[key];
+    if (bucket.length > 0){
+      // Prefiere un candidato de fuente aún no usada en este lote si lo hay
+      let pos = bucket.findIndex(c => !usedSources.has(c.source));
+      if (pos === -1) pos = 0;
+      const [chosen] = bucket.splice(pos, 1);
+      usedSources.add(chosen.source);
+      result.push(chosen);
+      stalledPasses = 0;
+    } else {
+      stalledPasses++;
+    }
+    idx++;
+  }
+  return result;
+}
+
+/* =========================================================
+   FUENTE 1: JIKAN (MyAnimeList) — CORS habilitado, sin key
+   ========================================================= */
+async function jikanGet(path){
+  const res = await fetch(JIKAN_BASE + path);
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  const json = await res.json();
+  return json.data || [];
+}
+
+function jikanImage(entry){
+  return entry?.images?.jpg?.large_image_url || entry?.images?.jpg?.image_url || "";
+}
+
+// Anime en emisión esta temporada → útil para "Anime" y "Estrenos"
+async function fetchJikanSeasonNow(){
+  const data = await jikanGet("/seasons/now?limit=20");
+  return shuffle(data).slice(0, 6).map(a => ({
+    uid: "mal-season-" + a.mal_id,
+    title: a.title,
+    summary: buildSynopsisSummary(a.synopsis, a.title),
+    image: jikanImage(a),
+    link: a.url,
+    source: "MyAnimeList (temporada actual)",
+    category: "anime",
+    postType: "noticia",
+    extra: { score: a.score, episodes: a.episodes, studios: (a.studios||[]).map(s=>s.name).join(", ") }
+  }));
+}
+
+// Próximos estrenos anunciados → "Estrenos" / "Adaptaciones"
+async function fetchJikanSeasonUpcoming(){
+  const data = await jikanGet("/seasons/upcoming?limit=20");
+  return shuffle(data).slice(0, 6).map(a => ({
+    uid: "mal-upcoming-" + a.mal_id,
+    title: a.title,
+    summary: buildSynopsisSummary(a.synopsis, a.title),
+    image: jikanImage(a),
+    link: a.url,
+    source: "MyAnimeList (próximos estrenos)",
+    category: "estrenos",
+    postType: "noticia",
+    extra: { season: a.season, year: a.year }
+  }));
+}
+
+// Manga mejor valorado → "Manga" (página aleatoria entre las primeras 5 para variar)
+async function fetchJikanTopManga(){
+  const page = 1 + Math.floor(Math.random() * 5);
+  const data = await jikanGet(`/top/manga?limit=15&page=${page}`);
+  return shuffle(data).slice(0, 6).map(m => ({
+    uid: "mal-manga-" + m.mal_id,
+    title: m.title,
+    summary: buildSynopsisSummary(m.synopsis, m.title),
+    image: jikanImage(m),
+    link: m.url,
+    source: "MyAnimeList (top manga)",
+    category: "manga",
+    postType: "ficha",
+    extra: { score: m.score, chapters: m.chapters, status: m.status }
+  }));
+}
+
+// Anime aleatorio → "Curiosidades"
+async function fetchJikanRandomAnime(){
+  try{
+    const res = await fetch(JIKAN_BASE + "/random/anime");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const json = await res.json();
+    const a = json.data;
+    if (!a) return [];
+    return [{
+      uid: "mal-random-" + a.mal_id + "-" + Date.now(),
+      title: a.title,
+      summary: buildSynopsisSummary(a.synopsis, a.title),
+      image: jikanImage(a),
+      link: a.url,
+      source: "MyAnimeList (curiosidad)",
+      category: "curiosidades",
+      postType: "curiosidad",
+      extra: { score: a.score, year: a.year }
+    }];
+  }catch(e){
+    return [];
+  }
+}
+
+// Manga aleatorio → más variedad de "Curiosidades" además del anime random
+async function fetchJikanRandomManga(){
+  try{
+    const res = await fetch(JIKAN_BASE + "/random/manga");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const json = await res.json();
+    const m = json.data;
+    if (!m) return [];
+    return [{
+      uid: "mal-random-manga-" + m.mal_id + "-" + Date.now(),
+      title: m.title,
+      summary: buildSynopsisSummary(m.synopsis, m.title),
+      image: jikanImage(m),
+      link: m.url,
+      source: "MyAnimeList (curiosidad manga)",
+      category: "curiosidades",
+      postType: "curiosidad",
+      extra: { score: m.score, chapters: m.chapters }
+    }];
+  }catch(e){
+    return [];
+  }
+}
+
+// Personajes más populares → contenido de "Curiosidades" centrado en personajes,
+// que suele generar mucho engagement en páginas de fans (identificación, nostalgia).
+async function fetchJikanTopCharacters(){
+  try{
+    const page = 1 + Math.floor(Math.random() * 10);
+    const data = await jikanGet(`/top/characters?limit=10&page=${page}`);
+    const picks = shuffle(data).slice(0, 3);
+    return picks.filter(c => c.about || c.name).map(c => ({
+      uid: "mal-char-" + c.mal_id,
+      title: c.name,
+      summary: buildSynopsisSummary(
+        c.about ? c.about.replace(/\r?\n/g, " ") : "",
+        c.name
+      ) || `${c.name} sigue siendo uno de los personajes favoritos de la comunidad.`,
+      image: c.images?.jpg?.image_url || "",
+      link: c.url,
+      source: "MyAnimeList (personaje popular)",
+      category: "curiosidades",
+      postType: "curiosidad",
+      extra: { favorites: c.favorites ? formatNumber(c.favorites) : null }
+    }));
+  }catch(e){
+    return [];
+  }
+}
+
+// Debates/encuestas: reutiliza títulos reales del top de anime (Jikan) para
+// que la pregunta tenga sustancia, sin inventar datos ni afirmar hechos —
+// es explícitamente una pregunta de opinión a la audiencia.
+// Pagina aleatoriamente sobre un rango amplio del top para no repetir siempre
+// los mismos 10 títulos más populares.
+async function fetchDebateTopics(){
+  const page = 1 + Math.floor(Math.random() * 8);
+  const data = await jikanGet(`/top/anime?limit=15&page=${page}`);
+  const picks = shuffle(data).slice(0, 3);
+  return picks.map(a => {
+    const template = DEBATE_TEMPLATES[Math.floor(Math.random() * DEBATE_TEMPLATES.length)];
+    return {
+      uid: "debate-" + a.mal_id + "-" + Date.now() + "-" + Math.floor(Math.random()*1000),
+      title: a.title,
+      summary: template(a.title),
+      image: jikanImage(a),
+      link: a.url,
+      source: "Debate de la comunidad",
+      category: "anime",
+      postType: "debate"
+    };
+  });
+}
+
+function buildSynopsisSummary(synopsis, title){
+  if (!synopsis) return `Novedades confirmadas sobre ${title}. Consulta la ficha oficial para más detalles y súmate a la conversación en los comentarios.`;
+  return truncate(synopsis.replace(/\[Written by MAL Rewrite\]/gi, "").trim(), 480);
+}
+
+/* =========================================================
+   FUENTE 2: ANILIST — GraphQL, CORS abierto, sin key
+   ========================================================= */
+async function aniListQuery(query, variables){
+  const res = await fetch(ANILIST_ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Accept": "application/json" },
+    body: JSON.stringify({ query, variables })
+  });
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  const json = await res.json();
+  if (json.errors) throw new Error(json.errors[0]?.message || "GraphQL error");
+  return json.data;
+}
+
+// Manhwa (origen Corea) en tendencia → "Manhwa"
+async function fetchAniListManhwa(){
+  const query = `
+    query ($page: Int) {
+      Page(page: $page, perPage: 10) {
+        media(type: MANGA, countryOfOrigin: "KR", sort: TRENDING_DESC) {
+          id
+          title { romaji english }
+          description(asHtml: false)
+          coverImage { large }
+          siteUrl
+          status
+          chapters
+          averageScore
+        }
+      }
+    }`;
+  const page = 1 + Math.floor(Math.random() * 4);
+  const data = await aniListQuery(query, { page });
+  const list = data?.Page?.media || [];
+  return shuffle(list).slice(0, 6).map(m => ({
+    uid: "anilist-manhwa-" + m.id,
+    title: m.title.english || m.title.romaji,
+    summary: buildSynopsisSummary(stripHtml(m.description || ""), m.title.romaji),
+    image: m.coverImage?.large || "",
+    link: m.siteUrl,
+    source: "AniList (manhwa en tendencia)",
+    category: "manhwa",
+    postType: "ficha",
+    extra: { status: m.status, score: m.averageScore }
+  }));
+}
+
+// Anime en tendencia global según AniList → variedad para "Anime"
+async function fetchAniListTrendingAnime(){
+  const query = `
+    query ($page: Int) {
+      Page(page: $page, perPage: 10) {
+        media(type: ANIME, sort: TRENDING_DESC) {
+          id
+          title { romaji english }
+          description(asHtml: false)
+          coverImage { large }
+          siteUrl
+          status
+          averageScore
+          studios(isMain: true) { nodes { name } }
+        }
+      }
+    }`;
+  const page = 1 + Math.floor(Math.random() * 4);
+  const data = await aniListQuery(query, { page });
+  const list = data?.Page?.media || [];
+  return shuffle(list).slice(0, 6).map(m => ({
+    uid: "anilist-anime-" + m.id,
+    title: m.title.english || m.title.romaji,
+    summary: buildSynopsisSummary(stripHtml(m.description || ""), m.title.romaji),
+    image: m.coverImage?.large || "",
+    link: m.siteUrl,
+    source: "AniList (tendencia)",
+    category: "anime",
+    postType: "ficha",
+    extra: { status: m.status, score: m.averageScore, studio: (m.studios?.nodes||[]).map(s=>s.name).join(", ") }
+  }));
+}
+
+/* =========================================================
+   FUENTE 3: RSS (videojuegos y noticias generales) — vía proxy
+   ========================================================= */
+async function fetchRssFeed(feed){
+  const url = CORS_PROXY + encodeURIComponent(feed.url);
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  const text = await res.text();
+
+  const parser = new DOMParser();
+  const xml = parser.parseFromString(text, "text/xml");
+  const parseError = xml.querySelector("parsererror");
+  if (parseError) throw new Error("XML inválido");
+
+  const items = Array.from(xml.querySelectorAll("item")).slice(0, 12);
+  let parsed;
+  if (items.length === 0){
+    const entries = Array.from(xml.querySelectorAll("entry")).slice(0, 12);
+    parsed = entries.map(e => parseAtomEntry(e, feed));
+  } else {
+    parsed = items.map(it => parseRssItem(it, feed));
+  }
+
+  // clasificar por keywords ya que el RSS no trae categoría propia
+  return parsed.map(p => ({
+    ...p,
+    category: classifyByKeywords(p),
+    postType: "noticia",
+    sourceIcon: feed.icon || "newspaper",
+    sourceKind: "media"
+  }));
+}
+
+function parseRssItem(it, feed){
+  const title = textOf(it, "title");
+  const link = textOf(it, "link") || attrLink(it);
+  const rawDesc = textOf(it, "description") || textOf(it, "summary") || "";
+  const desc = stripHtml(rawDesc);
+  const image = extractReliableImage(it, rawDesc);
+
+  const cleanLink = cleanText(link);
+  return {
+    uid: "rss-" + hashString(cleanLink),
+    title: cleanText(title),
+    link: cleanLink,
+    summary: truncate(desc, 420),
+    image,
+    source: feed.name,
+    feedCats: feed.baseCats
+  };
+}
+
+function parseAtomEntry(e, feed){
+  const title = textOf(e, "title");
+  let link = "";
+  const linkEl = e.querySelector("link");
+  if (linkEl) link = linkEl.getAttribute("href") || linkEl.textContent || "";
+  const rawDesc = textOf(e, "summary") || textOf(e, "content") || "";
+  const desc = stripHtml(rawDesc);
+  const image = extractReliableImage(e, rawDesc);
+
+  const cleanLink = cleanText(link);
+  return {
+    uid: "rss-" + hashString(cleanLink),
+    title: cleanText(title),
+    link: cleanLink,
+    summary: truncate(desc, 420),
+    image,
+    source: feed.name,
+    feedCats: feed.baseCats
+  };
+}
+
+/* =========================================================
+   FUENTE 4: REDDIT (comunidades reales) — Atom vía proxy CORS
+   Los hilos de Reddit no traen categoría ni imagen estructurada como
+   el RSS de medios: el título de un post no siempre resume el hilo,
+   y la miniatura viene embebida en el HTML de <content>. Se procesan
+   por separado y se marcan como contenido de comunidad, no editorial.
+   ========================================================= */
+async function fetchRedditFeed(feed){
+  const url = CORS_PROXY + encodeURIComponent(feed.url);
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  const text = await res.text();
+
+  const parser = new DOMParser();
+  const xml = parser.parseFromString(text, "text/xml");
+  if (xml.querySelector("parsererror")) throw new Error("XML inválido");
+
+  const entries = Array.from(xml.querySelectorAll("entry")).slice(0, 10);
+  const parsed = entries.map(e => parseRedditEntry(e, feed)).filter(p => p.title && p.link);
+
+  return parsed.map(p => ({
+    ...p,
+    category: classifyByKeywords(p) || feed.baseCats[0] || "curiosidades",
+    // Contenido de comunidad: se redacta como debate o curiosidad, nunca como
+    // "noticia oficial" ya que es la opinión/actividad de usuarios, no un medio.
+    postType: pick(["debate", "curiosidad"]),
+    sourceIcon: "reddit",
+    sourceKind: "community"
+  }));
+}
+
+function parseRedditEntry(e, feed){
+  const rawTitle = textOf(e, "title");
+  let link = "";
+  const linkEl = e.querySelector("link");
+  if (linkEl) link = linkEl.getAttribute("href") || "";
+  const rawContent = textOf(e, "content") || "";
+  const desc = stripHtml(rawContent);
+  const image = extractReliableImage(e, rawContent);
+
+  const cleanLink = cleanText(link);
+  return {
+    uid: "reddit-" + hashString(cleanLink),
+    title: cleanText(rawTitle),
+    link: cleanLink,
+    summary: truncate(desc, 380) || `Hilo activo en la comunidad ${feed.name} de Reddit.`,
+    image,
+    source: feed.name + " (Reddit)",
+    feedCats: feed.baseCats
+  };
+}
+
+function textOf(node, tag){
+  const el = node.querySelector(tag);
+  return el ? el.textContent : "";
+}
+function attrLink(node){
+  const el = node.querySelector("link");
+  return el ? (el.getAttribute("href") || "") : "";
+}
+
+// Cuando un ítem (normalmente de RSS) no trae imagen, intenta encontrar una imagen
+// real relacionada buscando el título en Jikan (MAL) y, si falla, en AniList.
+// Si ninguna búsqueda da resultado, el llamador debe usar FALLBACK_IMAGE_BY_CAT.
+async function findFallbackImageForTitle(title){
+  if (!title) return "";
+
+  // 1) Intentar Jikan (búsqueda simple por texto, primer resultado con imagen)
+  try{
+    const q = encodeURIComponent(title.slice(0, 60));
+    const res = await fetch(`${JIKAN_BASE}/anime?q=${q}&limit=1`);
+    if (res.ok){
+      const json = await res.json();
+      const hit = (json.data || [])[0];
+      const img = jikanImage(hit);
+      if (img) return img;
+    }
+  }catch(e){ /* seguimos al siguiente intento */ }
+
+  // 2) Intentar AniList (búsqueda por texto, primer resultado con portada)
+  try{
+    const query = `
+      query ($search: String) {
+        Media(search: $search, type: ANIME) {
+          coverImage { large }
+        }
+      }`;
+    const data = await aniListQuery(query, { search: title.slice(0, 60) });
+    const img = data?.Media?.coverImage?.large;
+    if (img) return img;
+  }catch(e){ /* seguimos al fallback genérico */ }
+
+  return "";
+}
+
+function classifyByKeywords(item){
+  const haystack = (item.title + " " + item.summary).toLowerCase();
+  const scores = {};
+  Object.keys(CATEGORIES).forEach(key => { scores[key] = 0; });
+
+  Object.entries(CATEGORIES).forEach(([key, cfg]) => {
+    cfg.kw.forEach(k => { if (haystack.includes(k)) scores[key] += 2; });
+  });
+  (item.feedCats || []).forEach(key => { if (scores[key] !== undefined) scores[key] += 1; });
+
+  let best = "videojuegos";
+  let bestScore = -1;
+  Object.entries(scores).forEach(([key, val]) => { if (val > bestScore){ bestScore = val; best = key; } });
+  return best;
+}
+
+/* =========================================================
+   REDACCIÓN DEL POST (estilo página de fans)
+   ========================================================= */
+const EMOJI_BY_CAT = {
+  "anime": "🎬", "manga": "📖", "manhwa": "🇰🇷", "videojuegos": "🎮",
+  "colaboraciones": "🤝", "polemicas": "⚠️", "adaptaciones": "🔄",
+  "live-action": "🎥", "curiosidades": "✨", "estrenos": "🚀"
+};
+
+// Iconos SVG por categoría — solo para los badges visuales de la tarjeta
+// (el texto de la publicación que se copia a Facebook sigue usando EMOJI_BY_CAT).
+const ICON_BY_CAT = {
+  "anime": "film", "manga": "book", "manhwa": "layers", "videojuegos": "gamepad",
+  "colaboraciones": "handshake", "polemicas": "alert", "adaptaciones": "refresh",
+  "live-action": "clapper", "curiosidades": "sparkles", "estrenos": "rocket"
+};
+
+// Imágenes genéricas de respaldo por categoría (Picsum con seed fija por categoría,
+// así siempre cae una imagen temática consistente y sin depender de terceros con key).
+// Se usan SOLO cuando la fuente original no trae ninguna imagen y no se encontró
+// una imagen relacionada al título vía AniList/Jikan (ver findFallbackImageForTitle).
+const FALLBACK_IMAGE_BY_CAT = {
+  "anime":            "https://picsum.photos/seed/otagen-anime/800/450",
+  "manga":             "https://picsum.photos/seed/otagen-manga/800/450",
+  "manhwa":            "https://picsum.photos/seed/otagen-manhwa/800/450",
+  "videojuegos":       "https://picsum.photos/seed/otagen-videojuegos/800/450",
+  "colaboraciones":    "https://picsum.photos/seed/otagen-colabs/800/450",
+  "polemicas":         "https://picsum.photos/seed/otagen-polemicas/800/450",
+  "adaptaciones":      "https://picsum.photos/seed/otagen-adapt/800/450",
+  "live-action":       "https://picsum.photos/seed/otagen-liveaction/800/450",
+  "curiosidades":      "https://picsum.photos/seed/otagen-curiosidades/800/450",
+  "estrenos":          "https://picsum.photos/seed/otagen-estrenos/800/450"
+};
+
+const OPENERS_NOTICIA = [
+  "¡Atención, comunidad! 👀",
+  "Esto se está moviendo fuerte 🔥",
+  "Dato confirmado directo de la fuente 📰",
+  "Guarda esta publicación, la vas a necesitar 📌",
+  "Para tu radar de hoy 🧭",
+  "Esto no te lo puedes perder 💥",
+  "Última hora para el fandom 🚨",
+  "Esto va a dar de qué hablar 🗣️"
+];
+
+const OPENERS_FICHA = [
+  "Ficha del día 📌",
+  "¿Ya la tienes en tu lista? 👀",
+  "Recomendación con datos reales 🎯",
+  "Para los que buscan algo nuevo que ver/leer 📖",
+  "Pin fijado en la lista de pendientes 📍",
+  "Esta ficha se guarda, no se scrollea 🔖"
+];
+
+const OPENERS_CURIOSIDAD = [
+  "Dato random pero real 🎲",
+  "¿Sabías esto? 🤔",
+  "Curiosidad del día ✨",
+  "Esto seguro no lo sabías 👀",
+  "Trivia para presumir con tus amigos 🧠",
+  "El dato que nadie te contó 🕵️"
+];
+
+const OPENERS_DEBATE = [
+  "Hora de debate 💬",
+  "Queremos su opinión 👇",
+  "Esto siempre genera pelea en los comentarios 😂",
+  "Pregunta seria para la comunidad 🧵",
+  "Aquí se arma la discusión 🍿",
+  "No hay opinión incorrecta, pero defiéndela 🗯️"
+];
+
+// Cierres de engagement: se agregan al final del cuerpo, antes de fuente/hashtags,
+// para invitar a comentar/compartir y así ayudar a que la página crezca.
+const ENGAGEMENT_CLOSERS = [
+  "¿Tú qué opinas? Déjanoslo en los comentarios 👇",
+  "Etiqueta a alguien que necesita ver esto 🏷️",
+  "Comparte esta publicación si estás de acuerdo 🔁",
+  "Guarda este post para no perdértelo después 📌",
+  "¿Sí o no? Cuéntanos en comentarios 💬",
+  "Sigamos la conversación abajo 👇"
+];
+
+// Bloques de hashtags variados por categoría, además de los genéricos del nicho.
+// Rotar hashtags ayuda a llegar a más audiencias dentro de Facebook.
+const HASHTAGS_BY_CAT = {
+  "anime":         ["#AnimeNews", "#AnimeCommunity", "#Otaku"],
+  "manga":          ["#MangaNews", "#MangaCommunity", "#Mangaka"],
+  "manhwa":         ["#Manhwa", "#Webtoon", "#ManhwaCommunity"],
+  "videojuegos":    ["#Videojuegos", "#Gaming", "#Gamers"],
+  "colaboraciones": ["#Colaboracion", "#Crossover"],
+  "polemicas":      ["#Polemica", "#Controversia"],
+  "adaptaciones":   ["#Adaptacion", "#NuevaSerie"],
+  "live-action":    ["#LiveAction", "#Adaptacion"],
+  "curiosidades":   ["#Curiosidades", "#DatoCurioso"],
+  "estrenos":       ["#Estreno", "#ProximoEstreno"]
+};
+
+function pick(arr){ return arr[Math.floor(Math.random() * arr.length)]; }
+
+function hashtagLine(catKey){
+  const specific = HASHTAGS_BY_CAT[catKey] || [];
+  const base = ["#Anime", "#Manga", "#Manhwa", "#Videojuegos"];
+  // Combina específicos de categoría + 2 genéricos aleatorios, sin repetir.
+  const combined = [...specific, ...shuffle([...base]).slice(0, 2)];
+  return Array.from(new Set(combined)).join(" ");
+}
+
+function buildPost(item){
+  const catKey = item.category || "anime";
+  const cat = CATEGORIES[catKey] || CATEGORIES["anime"];
+  const emoji = EMOJI_BY_CAT[catKey] || "📰";
+  const type = item.postType || "noticia";
+
+  let extraLine = "";
+  if (item.extra){
+    const bits = [];
+    if (item.extra.score) bits.push(`⭐ ${item.extra.score}`);
+    if (item.extra.favorites) bits.push(`❤️ ${item.extra.favorites} favoritos`);
+    if (item.extra.episodes) bits.push(`${item.extra.episodes} episodios`);
+    if (item.extra.chapters) bits.push(`${item.extra.chapters} capítulos`);
+    if (item.extra.status) bits.push(`Estado: ${item.extra.status}`);
+    if (item.extra.year) bits.push(`Año: ${item.extra.year}`);
+    if (item.extra.season) bits.push(`Temporada: ${item.extra.season}`);
+    if (item.extra.studio) bits.push(`Estudio: ${item.extra.studio}`);
+    if (item.extra.studios) bits.push(`Estudio: ${item.extra.studios}`);
+    if (bits.length) extraLine = "📊 " + bits.join(" · ") + "\n\n";
+  }
+
+  const closer = pick(ENGAGEMENT_CLOSERS);
+  const tags = hashtagLine(catKey);
+
+  // El "headline" es un título de gancho, corto y llamativo, pensado para ser
+  // la primera línea que se lee en Facebook (mucho más scrolleable que el
+  // título técnico crudo de la fuente). El título original SIEMPRE se conserva
+  // también dentro del cuerpo del post para no perder contexto/veracidad.
+  let headline;
+  let bodyLines;
+
+  if (type === "debate"){
+    const opener = pick(OPENERS_DEBATE);
+    headline = `${emoji} DEBATE: ${item.title}`;
+    bodyLines = [
+      opener,
+      "",
+      item.summary,
+      "",
+      `📎 Sobre: ${item.title}`,
+      `🔗 Ficha completa en el enlace de abajo.`,
+      "",
+      closer,
+      "",
+      `${tags} #Debate`
+    ];
+  } else if (type === "curiosidad"){
+    const opener = pick(OPENERS_CURIOSIDAD);
+    headline = `${emoji} ¿Sabías esto sobre ${item.title}?`;
+    bodyLines = [
+      opener,
+      "",
+      item.summary,
+      "",
+      extraLine.trim(),
+      `📎 Fuente: ${item.source}`,
+      `🔗 Más info y ficha completa en el enlace de abajo.`,
+      "",
+      closer,
+      "",
+      `${tags} #Curiosidades`
+    ];
+  } else if (type === "ficha"){
+    const opener = pick(OPENERS_FICHA);
+    headline = `${emoji} FICHA: ${item.title}`;
+    bodyLines = [
+      opener,
+      "",
+      item.summary,
+      "",
+      extraLine.trim(),
+      `📎 Fuente: ${item.source}`,
+      `🔗 Ficha completa, tráiler y más detalles en el enlace de abajo.`,
+      "",
+      closer,
+      "",
+      tags
+    ];
+  } else {
+    const opener = pick(OPENERS_NOTICIA);
+    headline = `${emoji} ${item.title}`;
+    bodyLines = [
+      opener,
+      "",
+      item.summary,
+      "",
+      extraLine.trim(),
+      `📎 Fuente oficial: ${item.source}`,
+      `🔗 Nota completa en el enlace de abajo.`,
+      "",
+      closer,
+      "",
+      tags
+    ];
+  }
+
+  // Filtra líneas vacías duplicadas que puedan quedar por campos "extra" ausentes,
+  // conservando saltos de párrafo simples (una línea en blanco entre bloques).
+  const text = [headline, ""].concat(bodyLines)
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  return {
+    id: cryptoRandomId(),
+    uid: item.uid,
+    title: item.title,
+    headline,
+    summary: item.summary,
+    image: item.image,
+    imageIsFallback: !!item.imageIsFallback,
+    link: item.link,
+    source: item.source,
+    sourceIcon: item.sourceIcon || "newspaper",
+    sourceKind: item.sourceKind || "media",
+    category: catKey,
+    postType: type,
+    postText: text,
+    createdAt: new Date().toISOString()
+  };
+}
+
+/* =========================================================
+   RENDER FEED
+   ========================================================= */
+function renderFeed(){
+  const list = activeFilter === "all"
+    ? allPosts
+    : allPosts.filter(p => p.category === activeFilter);
+
+  if (list.length === 0){
+    feedContainer.innerHTML = `
+      <div class="empty-state">
+        <div class="glyph">${svgIcon("newspaper")}</div>
+        <p>Todavía no hay publicaciones ${activeFilter !== 'all' ? 'en esta categoría' : 'guardadas'}.</p>
+        <div class="hint">Pulsa «Generar» para buscar contenido nuevo</div>
+      </div>`;
+    return;
+  }
+
+  feedContainer.innerHTML = `<div class="feed">${list.map(cardHtml).join("")}</div>`;
+
+  list.forEach(p => {
+    const fbBtn = document.getElementById("fb-" + p.id);
+    if (fbBtn) fbBtn.addEventListener("click", () => onPublishClick(p));
+    const copyBtn = document.getElementById("copy-" + p.id);
+    if (copyBtn) copyBtn.addEventListener("click", () => onCopyClick(p));
+    const dlImgBtn = document.getElementById("dlimg-" + p.id);
+    if (dlImgBtn) dlImgBtn.addEventListener("click", () => onDownloadImageClick(p));
+    const dlCardBtn = document.getElementById("dlcard-" + p.id);
+    if (dlCardBtn) dlCardBtn.addEventListener("click", () => onDownloadCardClick(p));
+    const toggleBtn = document.getElementById("toggle-" + p.id);
+    if (toggleBtn) toggleBtn.addEventListener("click", () => {
+      const postEl = document.getElementById("post-" + p.id);
+      const expanded = postEl.classList.toggle("expanded");
+      toggleBtn.textContent = expanded ? "Ver menos ▴" : "Ver publicación completa ▾";
+    });
+  });
+}
+
+function cardHtml(p){
+  const cat = CATEGORIES[p.category] || CATEGORIES["anime"];
+  const type = POST_TYPES[p.postType] || POST_TYPES["noticia"];
+  const catIcon = ICON_BY_CAT[p.category] || "sparkles";
+  const dateStr = new Date(p.createdAt).toLocaleString();
+  const headline = p.headline || p.title;
+  return `
+    <article class="card">
+      <div class="card-media">
+        ${p.image
+          ? `<img src="${escapeAttr(p.image)}" alt="" loading="lazy" id="img-${p.id}" crossorigin="anonymous" onerror="this.parentElement.innerHTML='<div class=&quot;noimg&quot;>Imagen no disponible</div>'">`
+          : `<div class="noimg">Sin imagen disponible</div>`}
+        <span class="card-cat" style="color:${cat.color}">${svgIcon(catIcon)}${cat.label}</span>
+        <span class="card-type">${svgIcon(type.icon)}${type.label}</span>
+        ${p.imageIsFallback ? `<span class="card-fallback-flag">${svgIcon("layers")}Imagen de respaldo</span>` : ""}
+      </div>
+      <div class="card-body">
+        <div class="card-source-row">
+          ${svgIcon(p.sourceIcon || "newspaper")}
+          <div class="card-source">${escapeHtml(p.source)} · ${dateStr}</div>
+        </div>
+        <div class="card-post" id="post-${p.id}"><span class="headline">${escapeHtml(headline)}</span>${escapeHtml(p.postText)}</div>
+        <button class="card-toggle" id="toggle-${p.id}">Ver publicación completa ▾</button>
+        <a class="card-link" href="${escapeAttr(p.link)}" target="_blank" rel="noopener noreferrer">${svgIcon("link")} Ver ${p.sourceKind === "community" ? "publicación" : "ficha / noticia"} original</a>
+        <div class="card-actions">
+          <button class="btn btn-fb" id="fb-${p.id}">${isFbConnected() ? svgIcon("rocket") + " Publicar automáticamente" : "Publicar en Facebook"}</button>
+        </div>
+        <div class="card-actions" style="margin-top:8px;">
+          <button class="btn btn-ghost btn-sm" id="copy-${p.id}" style="flex:1;">Copiar texto</button>
+        </div>
+        ${p.image ? `
+        <div class="card-actions" style="margin-top:8px;">
+          <button class="btn btn-ghost btn-sm" id="dlimg-${p.id}" style="flex:1;">${svgIcon("download")} Descargar imagen</button>
+          <button class="btn btn-ghost btn-sm" id="dlcard-${p.id}" style="flex:1;">${svgIcon("image")} Descargar tarjeta</button>
+        </div>` : ""}
+        <div class="copied-flag" id="flag-${p.id}">Texto copiado ✓</div>
+      </div>
+    </article>
+  `;
+}
+
+/* =========================================================
+   ACCIONES: publicar / copiar
+   ========================================================= */
+async function onPublishClick(p){
+  const fbBtn = document.getElementById("fb-" + p.id);
+
+  if (isFbConnected()){
+    if (fbBtn){ fbBtn.disabled = true; fbBtn.textContent = "Publicando…"; }
+    try{
+      await publishToFacebookGraph(p);
+      if (fbBtn){ fbBtn.textContent = "✅ Publicado"; }
+      log(`Publicado directamente en Facebook: "${p.title}"`, "ok");
+      flashCopied(p.id, "Publicado en tu página ✓");
+      return;
+    }catch(e){
+      log(`Fallo publicando "${p.title}" vía API (${e.message || e}). Cambiando a modo manual.`, "err");
+      if (fbBtn){ fbBtn.disabled = false; fbBtn.textContent = "Publicar en Facebook"; }
+      alert("No se pudo publicar automáticamente (" + (e.message || e) + "). Revisa tu token en Conectar Facebook, o publica de forma manual: se copió el texto y se abrirá Facebook.");
+      // sigue al modo manual como respaldo
+    }
+  }
+
+  copyText(p.postText).finally(() => {
+    window.open("https://www.facebook.com/", "_blank", "noopener,noreferrer");
+    flashCopied(p.id);
+  });
+}
+
+function onCopyClick(p){
+  copyText(p.postText).then(() => flashCopied(p.id));
+}
+
+function flashCopied(id, customMsg){
+  const flag = document.getElementById("flag-" + id);
+  if (!flag) return;
+  flag.textContent = customMsg || "Texto copiado ✓";
+  flag.classList.add("show");
+  setTimeout(() => {
+    flag.classList.remove("show");
+    flag.textContent = "Texto copiado ✓";
+  }, 2200);
+}
+
+/* =========================================================
+   DESCARGA DE IMÁGENES
+   ========================================================= */
+
+// Descarga la imagen original tal cual (link directo), sin modificarla.
+async function onDownloadImageClick(p){
+  if (!p.image) return;
+  try{
+    const res = await fetch(p.image, { mode: "cors" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const blob = await res.blob();
+    triggerBlobDownload(blob, fileNameFor(p, "original"));
+  }catch(e){
+    // Si el CORS bloquea la descarga directa, abrimos la imagen en pestaña nueva
+    // para que el usuario la guarde manualmente (clic derecho > guardar imagen).
+    window.open(p.image, "_blank", "noopener,noreferrer");
+    log(`No se pudo descargar automáticamente "${p.title}" (CORS). Se abrió en una pestaña nueva.`, "err");
+  }
+}
+
+// Genera una tarjeta lista para publicar: foto de portada + degradado + título +
+// marca "OtaGen", dibujada en un <canvas> y exportada como PNG descargable.
+async function onDownloadCardClick(p){
+  if (!p.image) return;
+  try{
+    const img = await loadImageForCanvas(p.image);
+    const canvas = document.createElement("canvas");
+    const W = 1080, H = 1080; // formato cuadrado, óptimo para Facebook
+    canvas.width = W; canvas.height = H;
+    const ctx = canvas.getContext("2d");
+
+    // Imagen de fondo recortada tipo "cover"
+    drawImageCover(ctx, img, 0, 0, W, H);
+
+    // Degradado oscuro inferior para que el texto sea legible
+    const grad = ctx.createLinearGradient(0, H * 0.35, 0, H);
+    grad.addColorStop(0, "rgba(10,12,15,0)");
+    grad.addColorStop(1, "rgba(10,12,15,0.92)");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+
+    // Chip de categoría arriba a la izquierda
+    const cat = CATEGORIES[p.category] || CATEGORIES["anime"];
+    ctx.font = "600 28px 'Segoe UI', sans-serif";
+    const catLabel = cat.label.toUpperCase();
+    const catWidth = ctx.measureText(catLabel).width;
+    ctx.fillStyle = "rgba(10,12,15,0.72)";
+    roundRect(ctx, 40, 40, catWidth + 48, 52, 26);
+    ctx.fill();
+    ctx.fillStyle = "#ffffff";
+    ctx.fillText(catLabel, 64, 76);
+
+    // Título (headline) en la parte inferior, con wrap automático
+    const title = p.headline || p.title;
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "800 56px 'Segoe UI', sans-serif";
+    wrapCanvasText(ctx, title, 48, H - 170, W - 96, 64, 3);
+
+    // Marca de agua "OtaGen" abajo a la derecha
+    ctx.font = "700 30px 'Segoe UI', sans-serif";
+    ctx.fillStyle = "rgba(255,255,255,0.85)";
+    ctx.textAlign = "right";
+    ctx.fillText("OtaGen", W - 40, H - 40);
+    ctx.textAlign = "left";
+
+    canvas.toBlob((blob) => {
+      if (blob) triggerBlobDownload(blob, fileNameFor(p, "tarjeta"));
+    }, "image/png");
+  }catch(e){
+    log(`No se pudo generar la tarjeta de "${p.title}" (${e.message || e}).`, "err");
+    alert("No se pudo generar la tarjeta para descargar, probablemente por restricciones CORS de la imagen de origen. Puedes usar 'Descargar imagen' o abrir la imagen manualmente.");
+  }
+}
+
+function loadImageForCanvas(url){
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("No se pudo cargar la imagen"));
+    img.src = url;
+  });
+}
+
+function drawImageCover(ctx, img, x, y, w, h){
+  const imgRatio = img.width / img.height;
+  const boxRatio = w / h;
+  let sx, sy, sw, sh;
+  if (imgRatio > boxRatio){
+    sh = img.height;
+    sw = sh * boxRatio;
+    sx = (img.width - sw) / 2;
+    sy = 0;
+  } else {
+    sw = img.width;
+    sh = sw / boxRatio;
+    sx = 0;
+    sy = (img.height - sh) / 2;
+  }
+  ctx.drawImage(img, sx, sy, sw, sh, x, y, w, h);
+}
+
+function roundRect(ctx, x, y, w, h, r){
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+// Envuelve texto en varias líneas dentro de un ancho máximo, dibujando desde
+// abajo hacia arriba (útil para anclar el texto al pie de la tarjeta).
+function wrapCanvasText(ctx, text, x, yBottom, maxWidth, lineHeight, maxLines){
+  const words = text.split(" ");
+  const lines = [];
+  let current = "";
+  for (const word of words){
+    const test = current ? current + " " + word : word;
+    if (ctx.measureText(test).width > maxWidth && current){
+      lines.push(current);
+      current = word;
+      if (lines.length >= maxLines) break;
+    } else {
+      current = test;
+    }
+  }
+  if (current && lines.length < maxLines) lines.push(current);
+  if (lines.length === maxLines && words.join(" ") !== lines.join(" ")){
+    lines[lines.length - 1] = lines[lines.length - 1].replace(/\s*\S*$/, "") + "…";
+  }
+
+  const startY = yBottom - (lines.length - 1) * lineHeight;
+  lines.forEach((line, i) => {
+    ctx.fillText(line, x, startY + i * lineHeight);
+  });
+}
+
+function triggerBlobDownload(blob, filename){
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+
+function fileNameFor(p, suffix){
+  const slug = (p.title || "post")
+    .toLowerCase()
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40);
+  return `otagen-${slug}-${suffix}.png`;
+}
+
+async function copyText(text){
+  try{
+    await navigator.clipboard.writeText(text);
+  }catch(e){
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    try{ document.execCommand("copy"); }catch(e2){}
+    document.body.removeChild(ta);
+  }
+}
+
+/* =========================================================
+   UTILIDADES
+   ========================================================= */
+function stripHtml(html){
+  const div = document.createElement("div");
+  div.innerHTML = html;
+  return div.textContent || div.innerText || "";
+}
+
+// Extrae la imagen de portada del artículo priorizando SIEMPRE la de mayor
+// resolución disponible, no la primera que aparezca:
+// 1) media:content — se compara el ancho de TODAS las variantes y se toma la más grande
+// 2) enclosure de tipo imagen
+// 3) media:thumbnail
+// 4) primera <img> del cuerpo que NO parezca icono/avatar/tracker, con intento
+//    de "actualizar" la URL a su variante de mayor tamaño si el patrón es reconocible
+// Si nada alcanza el umbral mínimo de calidad, devuelve "" y la tarjeta mostrará
+// "sin imagen" en vez de arriesgarse a mostrar algo borroso o que no corresponde.
+const MIN_IMAGE_DIMENSION = 300; // px — antes 150/100, subido para exigir mejor calidad
+
+function extractReliableImage(node, rawDescHtml){
+  // 1) media:content — se recogen TODAS las variantes y se elige la de mayor ancho
+  const mediaContents = Array.from(node.querySelectorAll("media\\:content, content"));
+  let bestMedia = null;
+  let bestWidth = 0;
+  for (const mc of mediaContents){
+    const url = mc.getAttribute("url");
+    const medium = mc.getAttribute("medium");
+    const width = parseInt(mc.getAttribute("width") || "0", 10);
+    if (!url) continue;
+    if (medium !== "image" && !/\.(jpe?g|png|webp)(\?|$)/i.test(url)) continue;
+    // Si no trae ancho declarado, se acepta como candidato de respaldo (peso 1)
+    // pero se prioriza cualquier variante que sí declare tamaño y sea grande.
+    const w = width || 1;
+    if (w > bestWidth){ bestWidth = w; bestMedia = url; }
+  }
+  if (bestMedia && (bestWidth === 1 || bestWidth >= MIN_IMAGE_DIMENSION)) return upgradeImageUrl(bestMedia);
+
+  // 2) enclosure explícitamente de imagen
+  const enclosures = Array.from(node.querySelectorAll("enclosure"));
+  for (const enc of enclosures){
+    const type = enc.getAttribute("type") || "";
+    const url = enc.getAttribute("url") || "";
+    if (type.startsWith("image") && url) return upgradeImageUrl(url);
+  }
+
+  // 3) media:thumbnail como último recurso estructurado
+  const thumb = node.querySelector("media\\:thumbnail, thumbnail");
+  if (thumb){
+    const url = thumb.getAttribute("url");
+    if (url) return upgradeImageUrl(url);
+  }
+
+  // 4) todas las <img> razonables del cuerpo: se descartan iconos/trackers y,
+  // entre las que quedan, se elige la de mayor ancho/alto declarado.
+  const div = document.createElement("div");
+  div.innerHTML = rawDescHtml || "";
+  const imgs = Array.from(div.querySelectorAll("img"));
+  let bestImg = "";
+  let bestArea = 0;
+  for (const img of imgs){
+    const src = img.getAttribute("src") || "";
+    if (!src) continue;
+    if (looksLikeIconOrTracker(src, img)) continue;
+    const w = parseInt(img.getAttribute("width") || "0", 10);
+    const h = parseInt(img.getAttribute("height") || "0", 10);
+    const area = (w || MIN_IMAGE_DIMENSION) * (h || MIN_IMAGE_DIMENSION);
+    if (area >= bestArea){ bestArea = area; bestImg = src; }
+  }
+  if (bestImg) return upgradeImageUrl(bestImg);
+
+  return "";
+}
+
+// Intenta convertir una URL de miniatura conocida a su variante de mayor
+// resolución, reescribiendo patrones típicos de CDNs de WordPress y de Reddit.
+// Si no reconoce el patrón, devuelve la URL sin cambios (nunca rompe el link).
+function upgradeImageUrl(url){
+  if (!url) return url;
+  try{
+    // WordPress: recorta sufijos de miniatura tipo "-150x150.jpg" o "-300x169.jpg"
+    let u = url.replace(/-\d{2,4}x\d{2,4}(?=\.(jpe?g|png|webp)(\?|$))/i, "");
+    // Parámetros de resize en query string (?w=150, ?resize=150,84, ?width=150)
+    u = u.replace(/([?&])(w|width)=\d+/i, "$1$2=1200")
+         .replace(/([?&])resize=\d+,\d+/i, "$1resize=1200,675");
+    // Reddit external-preview / thumbnail: pide la variante "source" en vez del recorte pequeño
+    if (/preview\.redd\.it|external-preview\.redd\.it/i.test(u)){
+      u = u.replace(/width=\d+/i, "width=1200");
+    }
+    return u;
+  }catch(e){
+    return url;
+  }
+}
+
+// Filtra imágenes que casi seguro NO son la foto principal de la noticia:
+// iconos, avatares, logos, emojis, pixeles de tracking, gifs de carga.
+function looksLikeIconOrTracker(src, imgEl){
+  const lower = src.toLowerCase();
+  const badPatterns = [
+    "avatar","gravatar","icon","favicon","logo","emoji","spinner",
+    "loading","pixel","tracker","1x1","blank.gif","spacer",
+    "badge","sprite"
+  ];
+  if (badPatterns.some(p => lower.includes(p))) return true;
+
+  const w = parseInt(imgEl.getAttribute("width") || "0", 10);
+  const h = parseInt(imgEl.getAttribute("height") || "0", 10);
+  // Umbral subido: por debajo de esto la imagen suele verse pixelada al
+  // estirarla al ancho de una tarjeta 16:9 en pantallas de alta densidad.
+  if (w && w < MIN_IMAGE_DIMENSION) return true;
+  if (h && h < MIN_IMAGE_DIMENSION * 0.5) return true;
+
+  return false;
+}
+
+function formatNumber(n){
+  return new Intl.NumberFormat("es-ES").format(n);
+}
+
+function truncate(str, max){
+  str = (str || "").trim().replace(/\s+/g, " ");
+  if (str.length <= max) return str;
+  return str.slice(0, max).replace(/\s+\S*$/, "") + "…";
+}
+
+function cleanText(str){
+  return (str || "").trim().replace(/\s+/g, " ");
+}
+
+function escapeHtml(str){
+  return (str || "").replace(/[&<>"']/g, s => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[s]));
+}
+function escapeAttr(str){ return escapeHtml(str); }
+
+function shuffle(arr){
+  for (let i = arr.length - 1; i > 0; i--){
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+function cryptoRandomId(){
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  return "id-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+}
+
+// hash simple y estable para generar IDs únicos a partir de una URL (RSS no trae ID propio)
+function hashString(str){
+  let hash = 0;
+  for (let i = 0; i < str.length; i++){
+    hash = ((hash << 5) - hash) + str.charCodeAt(i);
+    hash |= 0;
+  }
+  return Math.abs(hash).toString(36);
+}
+
+init();
+})();
+</script>
+</body>
+</html>
