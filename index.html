@@ -947,6 +947,11 @@ const CORS_PROXIES = [
 const STORAGE_KEY_POSTS = "otagen_posts_v3";
 const STORAGE_KEY_SEEN  = "otagen_seen_ids_v3";
 const STORAGE_KEY_FB_CREDS = "otagen_fb_creds_v1";
+// Historial propio: cada vez que se publica de verdad en Facebook (vía API),
+// se guarda aquí {fbPostId, category, postType, publishedAtISO}. Esto es lo
+// que luego se cruza con datos reales de fb-insights.js para saber qué
+// categorías rinden mejor EN TU página, no en general.
+const STORAGE_KEY_PUBLISH_HISTORY = "otagen_publish_history_v1";
 const GRAPH_API_VERSION = "v21.0";
 
 
@@ -1030,6 +1035,24 @@ function loadFromStorage(){
 function saveToStorage(){
   localStorage.setItem(STORAGE_KEY_POSTS, JSON.stringify(allPosts));
   localStorage.setItem(STORAGE_KEY_SEEN, JSON.stringify(Array.from(seenIds)));
+}
+
+/* =========================================================
+   HISTORIAL REAL DE PUBLICACIONES (para cruzar con Insights)
+   ========================================================= */
+function loadPublishHistory(){
+  try{
+    const raw = localStorage.getItem(STORAGE_KEY_PUBLISH_HISTORY);
+    return raw ? JSON.parse(raw) : [];
+  }catch(e){ return []; }
+}
+
+function savePublishHistoryEntry(entry){
+  const history = loadPublishHistory();
+  history.push(entry);
+  // Se limita a los últimos 200 registros para no inflar localStorage indefinidamente.
+  const trimmed = history.slice(-200);
+  localStorage.setItem(STORAGE_KEY_PUBLISH_HISTORY, JSON.stringify(trimmed));
 }
 
 /* =========================================================
@@ -1206,6 +1229,7 @@ function applyChosenPage(page){
   fbPageChooser.style.display = "none";
   fbOAuthResult.textContent = `Conectado a "${page.name}" ✓ Token permanente obtenido automáticamente.`;
   fbOAuthResult.className = "modal-test-result ok";
+  renderSchedulePanel();
   setTimeout(closeFbConfigModal, 1200);
 }
 
@@ -1223,6 +1247,7 @@ function onFbConfigSave(){
   renderFeed();
   fbConfigResult.textContent = "Credenciales guardadas ✓";
   fbConfigResult.className = "modal-test-result ok";
+  renderSchedulePanel();
   setTimeout(closeFbConfigModal, 900);
 }
 
@@ -1236,6 +1261,8 @@ function onFbConfigDisconnect(){
   fbTokenInput.value = "";
   fbConfigResult.textContent = "Credenciales borradas.";
   fbConfigResult.className = "modal-test-result";
+  fbInsightsCache = null;
+  renderSchedulePanel();
 }
 
 // Publica directamente en la página de Facebook usando Graph API.
@@ -1308,75 +1335,168 @@ function renderLog(){
    página (Meta Business Suite) siempre van a ser más precisos con el
    tiempo, una vez tengas datos propios acumulados.
    ========================================================= */
-const SCHEDULE_WEEKDAY = [
-  { start: 7,  end: 9,  label: "Buenos días / camino al trabajo-escuela", types: ["curiosidad", "ficha"] },
-  { start: 9,  end: 12, label: "Zona muerta — evitar si puedes",          types: [] },
-  { start: 12, end: 14, label: "Pico de almuerzo 🔥",                      types: ["noticia", "curiosidad", "ficha"] },
-  { start: 14, end: 18, label: "Tarde tranquila",                          types: ["ficha", "curiosidad"] },
-  { start: 18, end: 20, label: "Salida del trabajo/escuela, calentando",   types: ["noticia", "ficha"] },
-  { start: 20, end: 23, label: "Pico de la noche 🔥🔥 (el mejor momento)",  types: ["debate", "noticia", "estrenos"] },
-  { start: 23, end: 24, label: "Público trasnochador, buen engagement",   types: ["debate", "curiosidad"] },
-  { start: 0,  end: 7,  label: "Zona muerta — no publicar",                types: [] }
-];
+// Caché en memoria de la última respuesta de fb-insights.js, para no volver
+// a pedirla en cada render (el toggle abrir/cerrar no debe re-consultar).
+let fbInsightsCache = null;
+let fbInsightsLoading = false;
+let fbInsightsError = null;
 
-const SCHEDULE_WEEKEND = [
-  { start: 8,  end: 11, label: "Mañana relajada de finde",                types: ["curiosidad", "ficha"] },
-  { start: 11, end: 14, label: "Pico de mediodía 🔥",                      types: ["noticia", "ficha", "debate"] },
-  { start: 14, end: 19, label: "Tarde de finde, mucha gente conectada",   types: ["debate", "noticia", "ficha"] },
-  { start: 19, end: 23, label: "Pico de la noche 🔥🔥 (el mejor momento)",  types: ["debate", "estrenos", "noticia"] },
-  { start: 23, end: 24, label: "Trasnochadores del finde",                types: ["debate", "curiosidad"] },
-  { start: 0,  end: 8,  label: "Zona muerta — no publicar",                types: [] }
-];
-
-function getScheduleForNow(){
-  const now = new Date();
-  const day = now.getDay(); // 0=domingo, 6=sábado
-  const hour = now.getHours();
-  const isWeekend = (day === 0 || day === 6);
-  const table = isWeekend ? SCHEDULE_WEEKEND : SCHEDULE_WEEKDAY;
-  const slot = table.find(s => hour >= s.start && hour < s.end) || table[table.length - 1];
-  return { table, slot, isWeekend, hour };
-}
-
-function scheduleAdviceText(slot){
-  if (!slot.types.length){
-    return "No es un buen horario para publicar ahora mismo. Guarda tus publicaciones generadas y prográmalas para el siguiente pico.";
+async function fetchFbInsights(){
+  if (!isFbConnected()) return null;
+  fbInsightsLoading = true;
+  fbInsightsError = null;
+  try{
+    const url = `/.netlify/functions/fb-insights?pageId=${encodeURIComponent(fbCreds.pageId)}&token=${encodeURIComponent(fbCreds.token)}`;
+    const res = await fetch(url);
+    const json = await res.json();
+    if (!res.ok || !json.ok) throw new Error(json.error || ("HTTP " + res.status));
+    fbInsightsCache = json;
+    return json;
+  }catch(e){
+    fbInsightsError = e.message || String(e);
+    fbInsightsCache = null;
+    return null;
+  }finally{
+    fbInsightsLoading = false;
   }
-  const typeLabels = slot.types.map(t => (POST_TYPES[t] || {label:t}).label);
-  return `Es buen momento para publicar. Prioriza: ${typeLabels.join(", ")}.`;
 }
 
-function renderSchedulePanel(){
-  const panel = $("schedulePanel");
-  const { table, slot, isWeekend } = getScheduleForNow();
+// Cruza el historial local de publicaciones (guardado con savePublishHistoryEntry)
+// con el rendimiento real por post que devolvió fb-insights.js, agrupando por
+// categoría. Solo con esto se puede decir honestamente "esta categoría rinde
+// mejor en TU página" — nunca antes de tener suficientes publicaciones cruzadas.
+function computeCategoryPerformance(postsPerformance){
+  const history = loadPublishHistory();
+  if (!postsPerformance || !postsPerformance.available || history.length === 0) return null;
 
-  const rows = table.map(s => {
-    const isActive = s === slot;
-    const timeLabel = `${String(s.start).padStart(2,"0")}:00–${String(s.end).padStart(2,"0")}:00`;
-    const typesLabel = s.types.length
-      ? s.types.map(t => `<span class="type-tag-item">${svgIcon((POST_TYPES[t]||{}).icon || "sparkles")}${(POST_TYPES[t]||{label:t}).label}</span>`).join("")
-      : "Evitar publicar";
-    return `
-      <div class="schedule-slot ${isActive ? "active" : ""}">
-        <span class="time">${timeLabel}</span>
-        <span class="desc">${s.label}<br><span class="type-tag">${typesLabel}</span></span>
+  const byFbId = {};
+  postsPerformance.posts.forEach(p => { byFbId[p.id] = p; });
+
+  const byCategory = {};
+  let matched = 0;
+  history.forEach(h => {
+    const perf = byFbId[h.fbPostId];
+    if (!perf) return; // el post pudo salir del rango de los últimos 25, o ser muy reciente y sin datos aún
+    matched++;
+    if (!byCategory[h.category]) byCategory[h.category] = { engagedUsers: 0, impressions: 0, count: 0 };
+    byCategory[h.category].engagedUsers += perf.engagedUsers;
+    byCategory[h.category].impressions += perf.impressions;
+    byCategory[h.category].count += 1;
+  });
+
+  if (matched === 0) return null;
+
+  const ranked = Object.entries(byCategory)
+    .map(([category, stats]) => ({
+      category,
+      avgEngaged: stats.engagedUsers / stats.count,
+      avgImpressions: stats.impressions / stats.count,
+      count: stats.count
+    }))
+    .sort((a, b) => b.avgEngaged - a.avgEngaged);
+
+  return { ranked, matchedCount: matched, totalHistory: history.length };
+}
+
+// Convierte topHoursUTC (horas en UTC que devuelve Facebook) a la hora local
+// del dispositivo, para que lo que se muestra sea directamente accionable.
+function utcHourToLocalLabel(hourUTC){
+  const now = new Date();
+  const utcRef = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), hourUTC, 0, 0));
+  return utcRef.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+async function renderSchedulePanel(){
+  const panel = $("schedulePanel");
+
+  if (!isFbConnected()){
+    panel.innerHTML = `
+      <div class="schedule-body open" style="padding:14px;">
+        <div class="schedule-now">
+          <span class="glyph">${svgIcon("dotOff")}</span>
+          <span class="txt">Conecta tu página de Facebook para ver la mejor hora para publicar, calculada con datos reales de tus seguidores (no una estimación genérica).</span>
+        </div>
       </div>`;
-  }).join("");
+    return;
+  }
 
   panel.innerHTML = `
-    <button class="schedule-toggle" id="scheduleToggleBtn">
-      <span class="toggle-label">${svgIcon("calendar")}Mejor hora para publicar hoy (${isWeekend ? "fin de semana" : "entre semana"})</span>
+    <div class="schedule-body open" style="padding:14px;">
+      <div class="schedule-now"><span class="txt">Consultando datos reales de tu página…</span></div>
+    </div>`;
+
+  const data = await fetchFbInsights();
+
+  if (!data){
+    panel.innerHTML = `
+      <div class="schedule-body open" style="padding:14px;">
+        <div class="schedule-now">
+          <span class="glyph">${svgIcon("dotOff")}</span>
+          <span class="txt">No se pudieron obtener datos reales de Insights (${escapeHtml(fbInsightsError || "error desconocido")}). Verifica que el permiso <b>read_insights</b> esté otorgado y que tu token esté vigente.</span>
+        </div>
+      </div>`;
+    return;
+  }
+
+  const fansOnline = data.fansOnline;
+  const perf = computeCategoryPerformance(data.postsPerformance);
+
+  let fansHtml;
+  if (fansOnline.available){
+    const rows = fansOnline.topHoursUTC.map(h => `
+      <div class="schedule-slot">
+        <span class="time">${utcHourToLocalLabel(h.hourUTC)}</span>
+        <span class="desc">${h.fans.toLocaleString()} seguidores conectados</span>
+      </div>`).join("");
+    fansHtml = `
+      <div class="schedule-now">
+        <span class="glyph">${svgIcon("dotOn")}</span>
+        <span class="txt">Top horas reales con más seguidores de <b>tu página</b> conectados${fansOnline.asOf ? ` (dato del ${new Date(fansOnline.asOf).toLocaleDateString()})` : ""}:</span>
+      </div>
+      <div class="schedule-grid">${rows}</div>`;
+  } else {
+    fansHtml = `
+      <div class="schedule-now">
+        <span class="glyph">${svgIcon("dotOff")}</span>
+        <span class="txt">Facebook todavía no tiene suficientes datos de "seguidores conectados por hora" para tu página. Motivo reportado: ${escapeHtml(fansOnline.reason)}</span>
+      </div>`;
+  }
+
+  let perfHtml;
+  if (perf){
+    const rows = perf.ranked.map(r => {
+      const cat = CATEGORIES[r.category] || { label: r.category, color: "var(--ink-dim)" };
+      return `
+        <div class="schedule-slot">
+          <span class="time" style="color:${cat.color}">${cat.label}</span>
+          <span class="desc">${r.avgEngaged.toFixed(1)} interacciones promedio · ${r.count} publicación(es) con datos</span>
+        </div>`;
+    }).join("");
+    perfHtml = `
+      <div class="schedule-note" style="margin-top:10px;">
+        Categorías ordenadas por interacción real en tus últimas publicaciones (${perf.matchedCount} de ${perf.totalHistory} posts de tu historial tenían datos disponibles):
+      </div>
+      <div class="schedule-grid">${rows}</div>`;
+  } else {
+    const history = loadPublishHistory();
+    perfHtml = `
+      <div class="schedule-note" style="margin-top:10px;">
+        Todavía no hay suficientes publicaciones tuyas con datos de rendimiento para saber qué categoría te funciona mejor
+        (${history.length} publicación(es) registrada(s) hasta ahora). Esto se va a ir llenando solo a medida que publiques
+        desde "Publicar automáticamente" y Facebook procese sus métricas.
+      </div>`;
+  }
+
+  panel.innerHTML = `
+    <button class="schedule-toggle open" id="scheduleToggleBtn">
+      <span class="toggle-label">${svgIcon("calendar")}Mejor hora y categoría para publicar — datos reales de tu página</span>
       <span class="arrow">▾</span>
     </button>
-    <div class="schedule-body" id="scheduleBody">
-      <div class="schedule-now">
-        <span class="glyph">${slot.types.length ? svgIcon("dotOn") : svgIcon("dotOff")}</span>
-        <span class="txt">${scheduleAdviceText(slot)}</span>
-      </div>
-      <div class="schedule-grid">${rows}</div>
+    <div class="schedule-body open" id="scheduleBody">
+      ${fansHtml}
+      ${perfHtml}
       <div class="schedule-note">
-        Calendario basado en patrones generales de páginas de anime/manga/videojuegos en Facebook.
-        Con el tiempo, revisa los Insights de tu página (Meta Business Suite) para afinar estos horarios con datos reales de tu audiencia.
+        Basado en Facebook Insights de tu propia página (page_fans_online + rendimiento de tus publicaciones vía la API). No es una estimación genérica.
       </div>
     </div>
   `;
@@ -2440,10 +2560,26 @@ async function onPublishClick(p){
   if (isFbConnected()){
     if (fbBtn){ fbBtn.disabled = true; fbBtn.textContent = "Publicando…"; }
     try{
-      await publishToFacebookGraph(p);
+      const fbResult = await publishToFacebookGraph(p);
       if (fbBtn){ fbBtn.textContent = "✅ Publicado"; }
       log(`Publicado directamente en Facebook: "${p.title}"`, "ok");
       flashCopied(p.id, "Publicado en tu página ✓");
+
+      // Se guarda el post_id REAL que devolvió Facebook (fbResult.id o
+      // fbResult.post_id, según sea /photos o /feed) junto con la categoría
+      // que le asignó el generador, para poder cruzarlo después con datos
+      // reales de rendimiento vía fb-insights.js. Sin este registro no hay
+      // forma honesta de saber qué categoría rinde mejor EN TU página.
+      const fbPostId = fbResult.post_id || fbResult.id || null;
+      if (fbPostId){
+        savePublishHistoryEntry({
+          fbPostId,
+          category: p.category,
+          postType: p.postType,
+          source: p.source,
+          publishedAtISO: new Date().toISOString()
+        });
+      }
       return;
     }catch(e){
       const msg = e.message || String(e);
