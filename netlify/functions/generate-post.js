@@ -82,7 +82,7 @@ ESTRUCTURA EXACTA del campo "body" (síguela al pie de la letra):
 2. Salto de línea doble ("\\n\\n").
 3. Segundo párrafo (1 a 3 líneas): un dato adicional, contexto breve, o una opinión/comentario genuino de fan sobre ese dato.
 4. Salto de línea doble.
-5. Cierre: una pregunta corta y directa a la comunidad para generar comentarios. Opcionalmente, dos opciones tipo encuesta en líneas separadas con emoji (ej. "🔥 SÍ, ..." / "👀 Prefiero...").
+5. Cierre: una pregunta corta y directa a la comunidad para generar comentarios. Cuando el tema se preste naturalmente a dos posturas o reacciones claras (ej. "¿esperaban esto o no?", "¿qué opinan del cambio de estudio?", una rivalidad entre personajes, una comparación), usa el formato de encuesta con dos opciones en líneas separadas con emoji (ej. "🔥 SÍ, ..." / "👀 Prefiero..."); si el tema no tiene dos posturas claras, deja solo la pregunta abierta sin forzar la encuesta.
 El body NUNCA va como un bloque de texto pegado: siempre debe tener esos saltos de línea dobles entre las 3 partes.
 
 LÍMITES (estrictos):
@@ -106,7 +106,10 @@ Responde EXCLUSIVAMENTE en el formato JSON solicitado.`;
     generationConfig: {
       temperature: 1.05,
       topP: 0.95,
-      maxOutputTokens: 1400,
+      maxOutputTokens: 2048,
+      thinkingConfig: {
+        thinkingBudget: 0
+      },
       responseMimeType: "application/json",
       responseSchema: {
         type: "OBJECT",
