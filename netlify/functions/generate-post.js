@@ -18,6 +18,13 @@
 const GEMINI_MODEL = "gemini-2.5-flash";
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
+// Groq: respaldo gratuito cuando Gemini se queda sin cuota diaria/por minuto.
+// Free tier de Groq es mucho más amplio (miles de requests/día). Se consigue
+// gratis en https://console.groq.com/keys (no pide tarjeta).
+// Variable de entorno requerida en Netlify: GROQ_API_KEY
+const GROQ_MODEL = "llama-3.3-70b-versatile";
+const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
+
 const POST_TYPE_GUIDANCE = {
   noticia: "Es una NOTICIA/novedad confirmada (temporada actual o próximo estreno). Anuncia la novedad con energía, como si fuera información fresca que la comunidad necesita saber ya.",
   ficha: "Es una FICHA/recomendación (por ejemplo, un manga o serie para descubrir). Preséntala como una recomendación entusiasta, invitando a la gente a sumarla a su lista.",
@@ -31,8 +38,9 @@ exports.handler = async (event) => {
   }
 
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    return jsonResponse({ error: "Falta configurar GEMINI_API_KEY en Netlify (Site settings > Environment variables)." }, 500);
+  const groqKey = process.env.GROQ_API_KEY;
+  if (!apiKey && !groqKey) {
+    return jsonResponse({ error: "Falta configurar GEMINI_API_KEY o GROQ_API_KEY en Netlify (Site settings > Environment variables)." }, 500);
   }
 
   let item;
@@ -101,6 +109,47 @@ ESTILO Y FORMATO:
 
 Responde EXCLUSIVAMENTE en el formato JSON solicitado.`;
 
+  // 1) Intentar con Gemini primero (si hay clave configurada).
+  if (apiKey) {
+    try {
+      const result = await tryGemini(prompt, apiKey);
+      if (result.ok) {
+        return jsonResponse(result.data, 200);
+      }
+      // Si Gemini falló (cuota, bloqueo, etc.) y tenemos Groq, caemos a Groq
+      // en vez de rendirnos directo a la plantilla del frontend.
+      if (!groqKey) {
+        return jsonResponse({ error: result.error }, result.status || 502);
+      }
+    } catch (e) {
+      if (!groqKey) {
+        const message = e.name === "AbortError" ? "Tiempo de espera agotado llamando a Gemini." : (e.message || String(e));
+        return jsonResponse({ error: message }, 500);
+      }
+      // sigue a Groq abajo
+    }
+  }
+
+  // 2) Respaldo con Groq (si Gemini no está configurado, falló, o no hay clave de Gemini).
+  if (groqKey) {
+    try {
+      const result = await tryGroq(prompt, groqKey);
+      if (result.ok) {
+        return jsonResponse(result.data, 200);
+      }
+      return jsonResponse({ error: result.error }, result.status || 502);
+    } catch (e) {
+      const message = e.name === "AbortError" ? "Tiempo de espera agotado llamando a Groq." : (e.message || String(e));
+      return jsonResponse({ error: message }, 500);
+    }
+  }
+
+  return jsonResponse({ error: "No hay proveedor de IA disponible." }, 500);
+};
+
+// Intenta generar el post con Gemini. Devuelve { ok:true, data } o
+// { ok:false, error, status }.
+async function tryGemini(prompt, apiKey) {
   const payload = {
     contents: [{ role: "user", parts: [{ text: prompt }] }],
     generationConfig: {
@@ -123,77 +172,119 @@ Responde EXCLUSIVAMENTE en el formato JSON solicitado.`;
     }
   };
 
+  const { json, res } = await callGeminiWithRetry(payload, apiKey);
+
+  if (!res.ok) {
+    const message = json?.error?.message || `HTTP ${res.status}`;
+    // 429 = se acabó la cuota gratuita del día/minuto.
+    return { ok: false, error: message, status: res.status };
+  }
+
+  const candidate = json?.candidates?.[0];
+  const rawText = candidate?.content?.parts?.[0]?.text;
+
+  if (!rawText) {
+    const reason = candidate?.finishReason || "desconocida";
+    return { ok: false, error: `Gemini no devolvió contenido (posible bloqueo de seguridad o corte, razón: ${reason}).`, status: 502 };
+  }
+
+  if (candidate?.finishReason === "MAX_TOKENS") {
+    return { ok: false, error: "La respuesta de Gemini se cortó por límite de tokens (MAX_TOKENS). Sube maxOutputTokens.", status: 502 };
+  }
+
+  return parsePostJSON(rawText, "Gemini");
+}
+
+// Intenta generar el post con Groq (API compatible con OpenAI). Devuelve
+// { ok:true, data } o { ok:false, error, status }.
+async function tryGroq(prompt, groqKey) {
+  const payload = {
+    model: GROQ_MODEL,
+    messages: [{ role: "user", content: prompt }],
+    temperature: 1.05,
+    top_p: 0.95,
+    max_tokens: 2048,
+    response_format: { type: "json_object" }
+  };
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 20000);
+  let res, json;
   try {
-    const { json, res } = await callGeminiWithRetry(payload, apiKey);
+    res = await fetch(GROQ_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${groqKey}`
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal
+    });
+    json = await res.json().catch(() => ({}));
+  } finally {
+    clearTimeout(timeout);
+  }
 
-    if (!res.ok) {
-      const message = json?.error?.message || `HTTP ${res.status}`;
-      // 429 = se acabó la cuota gratuita del día/minuto; el frontend cae a plantillas.
-      return jsonResponse({ error: message }, res.status);
-    }
+  if (!res.ok) {
+    const message = json?.error?.message || `HTTP ${res.status}`;
+    return { ok: false, error: `Groq: ${message}`, status: res.status };
+  }
 
-    const candidate = json?.candidates?.[0];
-    const rawText = candidate?.content?.parts?.[0]?.text;
+  const rawText = json?.choices?.[0]?.message?.content;
+  if (!rawText) {
+    return { ok: false, error: "Groq no devolvió contenido.", status: 502 };
+  }
 
-    if (!rawText) {
-      const reason = candidate?.finishReason || "desconocida";
-      return jsonResponse({ error: `Gemini no devolvió contenido (posible bloqueo de seguridad o corte, razón: ${reason}).` }, 502);
-    }
+  return parsePostJSON(rawText, "Groq");
+}
 
-    if (candidate?.finishReason === "MAX_TOKENS") {
-      return jsonResponse({ error: "La respuesta de Gemini se cortó por límite de tokens (MAX_TOKENS). Sube maxOutputTokens." }, 502);
-    }
+// Parsea el JSON { headline, body, hashtags } devuelto por cualquiera de
+// los dos proveedores y arma la respuesta final común.
+function parsePostJSON(rawText, providerName) {
+  let cleanText = rawText.trim();
+  if (cleanText.startsWith("```")) {
+    cleanText = cleanText.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
+  }
 
-    // Gemini a veces envuelve el JSON en un bloque de código markdown
-    // (```json ... ```) aunque se le pida responseMimeType "application/json".
-    // Limpiamos eso antes de intentar parsear.
-    let cleanText = rawText.trim();
-    if (cleanText.startsWith("```")) {
-      cleanText = cleanText.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
-    }
-    // A veces también puede venir con texto antes/después del JSON; intentamos
-    // extraer el primer objeto { ... } completo como último recurso.
-    let parsed;
-    try {
-      parsed = JSON.parse(cleanText);
-    } catch (e) {
-      const match = cleanText.match(/\{[\s\S]*\}/);
-      if (match) {
-        try {
-          parsed = JSON.parse(match[0]);
-        } catch (e2) {
-          return jsonResponse({ error: "No se pudo interpretar la respuesta de Gemini como JSON. Fragmento: " + cleanText.slice(0, 200) }, 502);
-        }
-      } else {
-        return jsonResponse({ error: "No se pudo interpretar la respuesta de Gemini como JSON. Fragmento: " + cleanText.slice(0, 200) }, 502);
+  let parsed;
+  try {
+    parsed = JSON.parse(cleanText);
+  } catch (e) {
+    const match = cleanText.match(/\{[\s\S]*\}/);
+    if (match) {
+      try {
+        parsed = JSON.parse(match[0]);
+      } catch (e2) {
+        return { ok: false, error: `No se pudo interpretar la respuesta de ${providerName} como JSON. Fragmento: ` + cleanText.slice(0, 200), status: 502 };
       }
+    } else {
+      return { ok: false, error: `No se pudo interpretar la respuesta de ${providerName} como JSON. Fragmento: ` + cleanText.slice(0, 200), status: 502 };
     }
+  }
 
-    if (!parsed.headline || !parsed.body) {
-      return jsonResponse({ error: "Respuesta de Gemini incompleta." }, 502);
-    }
+  if (!parsed.headline || !parsed.body) {
+    return { ok: false, error: `Respuesta de ${providerName} incompleta.`, status: 502 };
+  }
 
-    const hashtags = Array.isArray(parsed.hashtags)
-      ? parsed.hashtags.filter(h => typeof h === "string" && h.trim())
-      : [];
-    const hashtagLine = hashtags.map(h => h.trim().startsWith("#") ? h.trim() : "#" + h.trim()).join(" ");
+  const hashtags = Array.isArray(parsed.hashtags)
+    ? parsed.hashtags.filter(h => typeof h === "string" && h.trim())
+    : [];
+  const hashtagLine = hashtags.map(h => h.trim().startsWith("#") ? h.trim() : "#" + h.trim()).join(" ");
 
-    const fullText = [parsed.headline, "", parsed.body.trim(), hashtagLine]
-      .filter(line => line !== undefined && line !== null)
-      .join("\n\n")
-      .replace(/\n{3,}/g, "\n\n")
-      .trim();
+  const fullText = [parsed.headline, "", parsed.body.trim(), hashtagLine]
+    .filter(line => line !== undefined && line !== null)
+    .join("\n\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 
-    return jsonResponse({
+  return {
+    ok: true,
+    data: {
       headline: parsed.headline.trim(),
       text: fullText
-    }, 200);
-
-  } catch (e) {
-    const message = e.name === "AbortError" ? "Tiempo de espera agotado llamando a Gemini." : (e.message || String(e));
-    return jsonResponse({ error: message }, 500);
-  }
-};
+    }
+  };
+}
 
 async function callGeminiOnce(payload, apiKey, timeoutMs) {
   const controller = new AbortController();
