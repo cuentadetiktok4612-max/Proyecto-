@@ -525,12 +525,12 @@
   }
 
   .card-post{
-    font-size: 0.92rem;
-    line-height: 1.55;
+    font-size: 1.02rem;
+    line-height: 1.6;
     color: var(--ink);
     white-space: pre-wrap;
     margin-bottom: 6px;
-    max-height: 230px;
+    max-height: 260px;
     overflow: hidden;
     position: relative;
     -webkit-mask-image: linear-gradient(180deg, #000 75%, transparent 100%);
@@ -543,9 +543,10 @@
   }
   .card-post .headline{
     font-weight: 700;
-    font-size: 1rem;
+    font-size: 1.2rem;
+    line-height: 1.35;
     display: block;
-    margin-bottom: 6px;
+    margin-bottom: 8px;
   }
   .card-toggle{
     background: none;
@@ -557,19 +558,6 @@
     margin-bottom: 12px;
     cursor: pointer;
     -webkit-tap-highlight-color: transparent;
-  }
-
-  .card-link{
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    font-size: 0.76rem;
-    color: var(--ink-dim);
-    text-decoration: none;
-    border-bottom: 1px dashed var(--ink-faint);
-    padding-bottom: 1px;
-    margin-bottom: 14px;
-    word-break: break-all;
   }
 
   .card-actions{
@@ -1245,11 +1233,11 @@ function onFbConfigDisconnect(){
 }
 
 // Publica directamente en la página de Facebook usando Graph API.
-// Si el post tiene imagen, se publica en /photos (con el link y el texto como
-// caption); si no, se publica en /feed como texto + link.
+// La página nunca publica enlaces externos: siempre texto + imagen (foto/feed
+// nativo), sin adjuntar el link de la fuente original.
 async function publishToFacebookGraph(p){
   const base = `https://graph.facebook.com/${GRAPH_API_VERSION}/${encodeURIComponent(fbCreds.pageId)}`;
-  const message = p.postText + (p.link ? `\n\n${p.link}` : "");
+  const message = p.postText;
 
   if (p.image){
     const url = `${base}/photos`;
@@ -1266,7 +1254,6 @@ async function publishToFacebookGraph(p){
     const url = `${base}/feed`;
     const body = new URLSearchParams({
       message,
-      link: p.link || "",
       access_token: fbCreds.token
     });
     const res = await fetch(url, { method: "POST", body });
@@ -1490,24 +1477,38 @@ async function onGenerateClick(){
   // intentar variar categorías: no repetir la misma categoría más de lo necesario
   const chosen = pickDiverse(candidates, wanted);
 
-  // Resolver imágenes faltantes ANTES de construir los posts finales:
-  // 1) buscar una imagen real relacionada al título (Jikan/AniList)
-  // 2) si no aparece nada, usar la imagen genérica de la categoría
-  setStatus("Verificando imágenes de portada…", "busy");
-  await Promise.all(chosen.map(async (item) => {
-    if (item.image) return;
-    const found = await findFallbackImageForTitle(item.title);
-    item.image = found || FALLBACK_IMAGE_BY_CAT[item.category] || FALLBACK_IMAGE_BY_CAT["anime"];
-    item.imageIsFallback = true;
+  // Cada publicación se resuelve (imagen + texto) y se agrega al feed en
+  // cuanto está lista, en vez de esperar a que TODAS las imágenes terminen
+  // de buscarse. Así se van viendo publicaciones aparecer una a una.
+  setStatus(`Generando publicaciones (0/${chosen.length})…`, "busy");
+  let doneCount = 0;
+  const newPosts = [];
+
+  await Promise.all(chosen.map(async (item, idx) => {
+    if (!item.image){
+      const found = await findFallbackImageForTitle(item.title);
+      item.image = found || FALLBACK_IMAGE_BY_CAT[item.category] || FALLBACK_IMAGE_BY_CAT["anime"];
+      item.imageIsFallback = true;
+    }
+
+    // Pequeño escalonado por ítem para no saturar el límite de peticiones
+    // por minuto de la cuota gratuita de Gemini cuando se generan varias
+    // publicaciones a la vez.
+    await sleep(idx * 350);
+
+    const post = await buildPostWithAI(item);
+    newPosts.push(post);
+    seenIds.add(post.uid);
+
+    // Se inserta ordenado por más reciente (igual que antes), y se
+    // repinta el feed completo para reflejar la nueva llegada al instante.
+    allPosts = [post, ...allPosts];
+    saveToStorage();
+    renderFeed();
+
+    doneCount++;
+    setStatus(`Generando publicaciones (${doneCount}/${chosen.length})…`, "busy");
   }));
-
-  const newPosts = chosen.map(item => buildPost(item));
-
-  newPosts.forEach(p => seenIds.add(p.uid));
-  allPosts = newPosts.concat(allPosts);
-
-  saveToStorage();
-  renderFeed();
 
   if (newPosts.length < wanted){
     setStatus(`Generadas ${newPosts.length} de ${wanted} solicitadas (pocas novedades nuevas ahora)`, "ok");
@@ -1775,7 +1776,7 @@ async function fetchAniListManhwa(){
           id
           title { romaji english }
           description(asHtml: false)
-          coverImage { large }
+          coverImage { extraLarge large }
           siteUrl
           status
           chapters
@@ -1790,7 +1791,7 @@ async function fetchAniListManhwa(){
     uid: "anilist-manhwa-" + m.id,
     title: m.title.english || m.title.romaji,
     summary: buildSynopsisSummary(stripHtml(m.description || ""), m.title.romaji),
-    image: m.coverImage?.large || "",
+    image: m.coverImage?.extraLarge || m.coverImage?.large || "",
     link: m.siteUrl,
     source: "AniList (manhwa en tendencia)",
     category: "manhwa",
@@ -1808,7 +1809,7 @@ async function fetchAniListTrendingAnime(){
           id
           title { romaji english }
           description(asHtml: false)
-          coverImage { large }
+          coverImage { extraLarge large }
           siteUrl
           status
           averageScore
@@ -1823,7 +1824,7 @@ async function fetchAniListTrendingAnime(){
     uid: "anilist-anime-" + m.id,
     title: m.title.english || m.title.romaji,
     summary: buildSynopsisSummary(stripHtml(m.description || ""), m.title.romaji),
-    image: m.coverImage?.large || "",
+    image: m.coverImage?.extraLarge || m.coverImage?.large || "",
     link: m.siteUrl,
     source: "AniList (tendencia)",
     category: "anime",
@@ -1989,11 +1990,11 @@ async function findFallbackImageForTitle(title){
     const query = `
       query ($search: String) {
         Media(search: $search, type: ANIME) {
-          coverImage { large }
+          coverImage { extraLarge large }
         }
       }`;
     const data = await aniListQuery(query, { search: title.slice(0, 60) });
-    const img = data?.Media?.coverImage?.large;
+    const img = data?.Media?.coverImage?.extraLarge || data?.Media?.coverImage?.large;
     if (img) return img;
   }catch(e){ /* seguimos al fallback genérico */ }
 
@@ -2124,7 +2125,56 @@ function hashtagLine(catKey){
   return Array.from(new Set(combined)).join(" ");
 }
 
-function buildPost(item){
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+// Genera el texto de la publicación con IA (Gemini, vía función Netlify),
+// larga y carismática, siempre en español, traduciendo cualquier resumen
+// que venga en otro idioma. Si la función no está configurada, se quedó
+// sin cuota gratuita, o falla por cualquier razón, se cae automáticamente
+// al modo de plantillas local (buildPostTemplate) para que la app nunca
+// deje de funcionar.
+async function buildPostWithAI(item){
+  try{
+    const res = await fetch("/.netlify/functions/generate-post", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        title: item.title,
+        postType: item.postType,
+        category: item.category,
+        summary: item.summary,
+        extra: item.extra || null,
+        source: item.source
+      })
+    });
+    const json = await res.json();
+    if (!res.ok || !json.text){
+      throw new Error(json.error || `HTTP ${res.status}`);
+    }
+    return {
+      id: cryptoRandomId(),
+      uid: item.uid,
+      title: item.title,
+      headline: json.headline,
+      summary: item.summary,
+      image: item.image,
+      imageIsFallback: !!item.imageIsFallback,
+      link: item.link,
+      source: item.source,
+      sourceIcon: item.sourceIcon || "newspaper",
+      sourceKind: item.sourceKind || "media",
+      category: item.category || "anime",
+      postType: item.postType || "noticia",
+      postText: json.text,
+      createdAt: new Date().toISOString()
+    };
+  }catch(e){
+    log(`IA no disponible para "${item.title}" (${e.message || e}). Usando plantilla local de respaldo.`, "err");
+    return buildPostTemplate(item);
+  }
+}
+
+function buildPostTemplate(item){
   const catKey = item.category || "anime";
   const cat = CATEGORIES[catKey] || CATEGORIES["anime"];
   const emoji = EMOJI_BY_CAT[catKey] || "📰";
@@ -2164,7 +2214,6 @@ function buildPost(item){
       item.summary,
       "",
       `📎 Sobre: ${item.title}`,
-      `🔗 Ficha completa en el enlace de abajo.`,
       "",
       closer,
       "",
@@ -2180,7 +2229,6 @@ function buildPost(item){
       "",
       extraLine.trim(),
       `📎 Fuente: ${item.source}`,
-      `🔗 Más info y ficha completa en el enlace de abajo.`,
       "",
       closer,
       "",
@@ -2196,7 +2244,6 @@ function buildPost(item){
       "",
       extraLine.trim(),
       `📎 Fuente: ${item.source}`,
-      `🔗 Ficha completa, tráiler y más detalles en el enlace de abajo.`,
       "",
       closer,
       "",
@@ -2212,7 +2259,6 @@ function buildPost(item){
       "",
       extraLine.trim(),
       `📎 Fuente oficial: ${item.source}`,
-      `🔗 Nota completa en el enlace de abajo.`,
       "",
       closer,
       "",
@@ -2307,8 +2353,7 @@ function cardHtml(p){
         </div>
         <div class="card-post" id="post-${p.id}"><span class="headline">${escapeHtml(headline)}</span>${escapeHtml(p.postText)}</div>
         <button class="card-toggle" id="toggle-${p.id}">Ver publicación completa ▾</button>
-        <a class="card-link" href="${escapeAttr(p.link)}" target="_blank" rel="noopener noreferrer">${svgIcon("link")} Ver ${p.sourceKind === "community" ? "publicación" : "ficha / noticia"} original</a>
-        <div class="card-actions">
+        <div class="card-actions" style="margin-bottom:14px;">
           <button class="btn btn-fb" id="fb-${p.id}">${isFbConnected() ? svgIcon("rocket") + " Publicar automáticamente" : "Publicar en Facebook"}</button>
         </div>
         <div class="card-actions" style="margin-top:8px;">
@@ -2561,7 +2606,7 @@ function stripHtml(html){
 //    de "actualizar" la URL a su variante de mayor tamaño si el patrón es reconocible
 // Si nada alcanza el umbral mínimo de calidad, devuelve "" y la tarjeta mostrará
 // "sin imagen" en vez de arriesgarse a mostrar algo borroso o que no corresponde.
-const MIN_IMAGE_DIMENSION = 300; // px — antes 150/100, subido para exigir mejor calidad
+const MIN_IMAGE_DIMENSION = 500; // px — subido de 300 para exigir mejor calidad todavía
 
 function extractReliableImage(node, rawDescHtml){
   // 1) media:content — se recogen TODAS las variantes y se elige la de mayor ancho
@@ -2626,11 +2671,11 @@ function upgradeImageUrl(url){
     // WordPress: recorta sufijos de miniatura tipo "-150x150.jpg" o "-300x169.jpg"
     let u = url.replace(/-\d{2,4}x\d{2,4}(?=\.(jpe?g|png|webp)(\?|$))/i, "");
     // Parámetros de resize en query string (?w=150, ?resize=150,84, ?width=150)
-    u = u.replace(/([?&])(w|width)=\d+/i, "$1$2=1200")
-         .replace(/([?&])resize=\d+,\d+/i, "$1resize=1200,675");
+    u = u.replace(/([?&])(w|width)=\d+/i, "$1$2=1600")
+         .replace(/([?&])resize=\d+,\d+/i, "$1resize=1600,900");
     // Reddit external-preview / thumbnail: pide la variante "source" en vez del recorte pequeño
     if (/preview\.redd\.it|external-preview\.redd\.it/i.test(u)){
-      u = u.replace(/width=\d+/i, "width=1200");
+      u = u.replace(/width=\d+/i, "width=1600");
     }
     return u;
   }catch(e){
