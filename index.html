@@ -2297,19 +2297,20 @@ function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 // sin cuota gratuita, o falla por cualquier razón, se cae automáticamente
 // al modo de plantillas local (buildPostTemplate) para que la app nunca
 // deje de funcionar.
-// Genera el texto de la publicación con IA. El backend (generate-post.js)
-// intenta primero Gemini y, si falla por cuota u otro error, cae
-// automáticamente a Groq como respaldo. Solo si AMBOS fallan (o no están
-// configurados) esta función cae al modo de plantillas local
-// (buildPostTemplate) para que la app nunca deje de funcionar.
-async function buildPostWithAI(item){
+// Genera el texto de la publicación con IA. Se llama primero a
+// generate-post-gemini y, si falla (cuota agotada, error, timeout), se
+// llama a generate-post-groq como respaldo — como dos peticiones HTTP
+// independientes, cada una con su propio presupuesto completo de ~9s, en
+// vez de compartir un único presupuesto de 10s dentro de una sola función
+// (eso causaba timeouts que rompían el parseo JSON en el navegador). Solo
+// si AMBAS fallan (o no están configuradas) esta función cae al modo de
+// plantillas local (buildPostTemplate) para que la app nunca deje de
+// funcionar.
+async function callGeneratorFunction(path, item, timeoutMs){
   const controller = new AbortController();
-  // 55s: da margen a que el backend agote sus propios reintentos internos
-  // (Gemini hasta 2 intentos de 20s + Groq hasta 2 intentos), sin dejar al
-  // usuario esperando indefinidamente si la function completa se cuelga.
-  const timeout = setTimeout(() => controller.abort(), 55000);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try{
-    const res = await fetch("/.netlify/functions/generate-post", {
+    const res = await fetch(path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -2322,37 +2323,61 @@ async function buildPostWithAI(item){
       }),
       signal: controller.signal
     });
-    const json = await res.json();
-    if (!res.ok || !json.text){
-      throw new Error(json.error || `HTTP ${res.status}`);
+    const json = await res.json().catch(() => null);
+    if (!res.ok || !json || !json.text){
+      throw new Error((json && json.error) || `HTTP ${res.status}`);
     }
-    if (json.provider){
-      log(`"${item.title}" redactado con ${json.provider}.`, "ok");
-    }
-    return {
-      id: cryptoRandomId(),
-      uid: item.uid,
-      title: item.title,
-      headline: json.headline,
-      summary: item.summary,
-      image: item.image,
-      imageIsFallback: !!item.imageIsFallback,
-      link: item.link,
-      source: item.source,
-      sourceIcon: item.sourceIcon || "newspaper",
-      sourceKind: item.sourceKind || "media",
-      category: item.category || "anime",
-      postType: item.postType || "noticia",
-      postText: json.text,
-      createdAt: new Date().toISOString()
-    };
-  }catch(e){
-    const message = e.name === "AbortError" ? "tiempo de espera agotado" : (e.message || e);
-    log(`IA no disponible para "${item.title}" (${message}). Usando plantilla local de respaldo.`, "err");
-    return buildPostTemplate(item);
-  }finally{
+    return json;
+  } finally {
     clearTimeout(timeout);
   }
+}
+
+async function buildPostWithAI(item){
+  let json = null;
+  let lastError = null;
+
+  try{
+    json = await callGeneratorFunction("/.netlify/functions/generate-post-gemini", item, 10000);
+  }catch(e){
+    lastError = e;
+    log(`Gemini no disponible para "${item.title}" (${e.message || e}). Probando Groq…`, "warn");
+  }
+
+  if (!json){
+    try{
+      json = await callGeneratorFunction("/.netlify/functions/generate-post-groq", item, 10000);
+    }catch(e){
+      lastError = e;
+    }
+  }
+
+  if (!json){
+    const message = (lastError && (lastError.name === "AbortError" ? "tiempo de espera agotado" : (lastError.message || String(lastError)))) || "ningún proveedor de IA disponible";
+    log(`IA no disponible para "${item.title}" (${message}). Usando plantilla local de respaldo.`, "err");
+    return buildPostTemplate(item);
+  }
+
+  if (json.provider){
+    log(`"${item.title}" redactado con ${json.provider}.`, "ok");
+  }
+  return {
+    id: cryptoRandomId(),
+    uid: item.uid,
+    title: item.title,
+    headline: json.headline,
+    summary: item.summary,
+    image: item.image,
+    imageIsFallback: !!item.imageIsFallback,
+    link: item.link,
+    source: item.source,
+    sourceIcon: item.sourceIcon || "newspaper",
+    sourceKind: item.sourceKind || "media",
+    category: item.category || "anime",
+    postType: item.postType || "noticia",
+    postText: json.text,
+    createdAt: new Date().toISOString()
+  };
 }
 
 function buildPostTemplate(item){
