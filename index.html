@@ -1560,6 +1560,12 @@ async function onGenerateClick(){
   candidates = candidates.concat(await safeFetchGroup("AniList · manhwa trending", () => fetchAniListManhwa()));
   candidates = candidates.concat(await safeFetchGroup("AniList · anime trending", () => fetchAniListTrendingAnime()));
 
+  // --- 2.5) RAWG: fuente estructurada dedicada a videojuegos (lanzamientos
+  // confirmados, popularidad reciente, y datos curiosos con metacritic) ---
+  candidates = candidates.concat(await safeFetchGroup("RAWG · próximos lanzamientos", () => fetchRawgUpcoming()));
+  candidates = candidates.concat(await safeFetchGroup("RAWG · lanzamientos recientes", () => fetchRawgPopular()));
+  candidates = candidates.concat(await safeFetchGroup("RAWG · dato curioso", () => fetchRawgRandom()));
+
   // --- 3) Debates/encuestas: usan títulos reales de MAL top, sin inventar datos ---
   candidates = candidates.concat(await safeFetchGroup("Debates de la comunidad", () => fetchDebateTopics()));
 
@@ -1587,6 +1593,7 @@ async function onGenerateClick(){
     if (c.sourceIcon) return;
     if (c.uid.startsWith("mal-")) { c.sourceIcon = "bookmark"; c.sourceKind = "database"; }
     else if (c.uid.startsWith("anilist-")) { c.sourceIcon = "layers"; c.sourceKind = "database"; }
+    else if (c.uid.startsWith("rawg-")) { c.sourceIcon = "gamepad"; c.sourceKind = "database"; }
     else if (c.uid.startsWith("debate-")) { c.sourceIcon = "chat"; c.sourceKind = "community"; }
     else { c.sourceIcon = "newspaper"; c.sourceKind = "media"; }
   });
@@ -1979,6 +1986,90 @@ async function fetchAniListTrendingAnime(){
   }));
 }
 
+/* =========================================================
+   FUENTE: IGDB (videojuegos) — vía Netlify Function (igdb-games.js).
+   Se usa IGDB en vez de RAWG: RAWG mostró caídas frecuentes reportadas por
+   terceros. IGDB (respaldada por Twitch/Amazon) exige autenticación OAuth
+   y no se puede llamar con las credenciales expuestas directamente desde
+   el navegador, por eso pasa por esta función en el servidor.
+   ========================================================= */
+async function rawgGet(mode){
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  try{
+    const res = await fetch(`/.netlify/functions/igdb-games?mode=${encodeURIComponent(mode)}`, { signal: controller.signal });
+    const json = await res.json();
+    if (!res.ok || !json.ok) throw new Error(json.error || ("HTTP " + res.status));
+    return json.games || [];
+  }catch(e){
+    if (e.name === "AbortError") throw new Error("Tiempo de espera agotado (RAWG)");
+    throw e;
+  }finally{
+    clearTimeout(timeout);
+  }
+}
+
+// Construye un resumen a partir de datos ESTRUCTURADOS reales de RAWG
+// (género, plataformas, metacritic) — RAWG no da sinopsis narrativa en el
+// listado, así que nunca se inventa una; el redactor de IA recibe estos
+// datos reales como "extra" y "summary" para trabajar solo con hechos.
+function rawgSummary(g){
+  const bits = [];
+  if (g.released) bits.push(`Lanzamiento: ${g.released}`);
+  if (g.summaryHint) bits.push(g.summaryHint);
+  return bits.join(". ") || `Datos disponibles de "${g.title}" en RAWG.`;
+}
+
+// Próximos lanzamientos confirmados (60 días) → "Estrenos"
+async function fetchRawgUpcoming(){
+  const games = await rawgGet("upcoming");
+  return shuffle(games).slice(0, 5).map(g => ({
+    uid: "rawg-upcoming-" + g.id,
+    title: g.title,
+    summary: rawgSummary(g),
+    image: g.image,
+    link: `https://rawg.io/games/${g.id}`,
+    source: "RAWG (próximos lanzamientos)",
+    category: "videojuegos",
+    postType: "noticia",
+    extra: { year: g.released ? g.released.slice(0,4) : undefined, status: "Próximo lanzamiento" }
+  }));
+}
+
+// Lanzamientos recientes con más actividad → "Videojuegos" (noticia fresca)
+async function fetchRawgPopular(){
+  const games = await rawgGet("popular");
+  return shuffle(games).slice(0, 5).map(g => ({
+    uid: "rawg-popular-" + g.id,
+    title: g.title,
+    summary: rawgSummary(g),
+    image: g.image,
+    link: `https://rawg.io/games/${g.id}`,
+    source: "RAWG (lanzamientos recientes)",
+    category: "videojuegos",
+    postType: "noticia",
+    extra: { score: g.metacritic || undefined, year: g.released ? g.released.slice(0,4) : undefined }
+  }));
+}
+
+// Juego aleatorio bien valorado → "Curiosidades"
+async function fetchRawgRandom(){
+  const games = await rawgGet("random");
+  if (games.length === 0) return [];
+  const g = pick(games);
+  return [{
+    uid: "rawg-random-" + g.id + "-" + Date.now(),
+    title: g.title,
+    summary: rawgSummary(g),
+    image: g.image,
+    link: `https://rawg.io/games/${g.id}`,
+    source: "RAWG (dato curioso)",
+    category: "curiosidades",
+    postType: "curiosidad",
+    extra: { score: g.rating || undefined, year: g.released ? g.released.slice(0,4) : undefined }
+  }];
+}
+
 // Intenta traer una URL a través de la lista de proxies CORS en orden,
 // pasando al siguiente si el actual falla (HTTP no-ok, timeout o error de
 // red). Solo lanza error si TODOS los proxies fallan, para que una fuente
@@ -2333,22 +2424,33 @@ async function callGeneratorFunction(path, item, timeoutMs){
   }
 }
 
+// Cadena de proveedores de IA en orden de preferencia: Gemini (mejor
+// calidad) -> Groq (rápido, buen respaldo) -> OpenRouter (tercer respaldo
+// gratuito) -> plantilla local (si los tres fallan). Cada función de
+// Netlify tiene su propio presupuesto de tiempo independiente, así que
+// probar los tres en cadena no arriesga el límite de 10s de ninguno.
+const AI_PROVIDER_ENDPOINTS = [
+  { path: "/.netlify/functions/generate-post-gemini", name: "Gemini" },
+  { path: "/.netlify/functions/generate-post-groq", name: "Groq" },
+  { path: "/.netlify/functions/generate-post-openrouter", name: "OpenRouter" }
+];
+
 async function buildPostWithAI(item){
   let json = null;
   let lastError = null;
 
-  try{
-    json = await callGeneratorFunction("/.netlify/functions/generate-post-gemini", item, 10000);
-  }catch(e){
-    lastError = e;
-    log(`Gemini no disponible para "${item.title}" (${e.message || e}). Probando Groq…`, "warn");
-  }
-
-  if (!json){
+  for (let i = 0; i < AI_PROVIDER_ENDPOINTS.length; i++){
+    const provider = AI_PROVIDER_ENDPOINTS[i];
     try{
-      json = await callGeneratorFunction("/.netlify/functions/generate-post-groq", item, 10000);
+      json = await callGeneratorFunction(provider.path, item, 10000);
+      break;
     }catch(e){
       lastError = e;
+      const isLast = i === AI_PROVIDER_ENDPOINTS.length - 1;
+      if (!isLast){
+        const next = AI_PROVIDER_ENDPOINTS[i + 1].name;
+        log(`${provider.name} no disponible para "${item.title}" (${e.message || e}). Probando ${next}…`, "warn");
+      }
     }
   }
 
