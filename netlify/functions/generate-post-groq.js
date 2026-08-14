@@ -33,43 +33,31 @@ exports.handler = async (event) => {
   const parsed = parseAndValidateItem(event);
   if (parsed.error) return jsonResponse(parsed.error.body, parsed.error.status);
 
-  const prompt = buildPrompt(parsed.item);
-
-  const payload = {
-    model: GROQ_MODEL,
-    messages: [{ role: "user", content: prompt }],
-    temperature: 1.05,
-    top_p: 0.95,
-    max_tokens: 2048,
-    response_format: { type: "json_object" }
-  };
+  const basePrompt = buildPrompt(parsed.item);
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
   try {
-    const res = await fetch(GROQ_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${groqKey}`
-      },
-      body: JSON.stringify(payload),
-      signal: controller.signal
-    });
-    const json = await res.json().catch(() => ({}));
+    let result = await callGroqOnce(basePrompt, groqKey, controller.signal);
 
-    if (!res.ok) {
-      const message = json?.error?.message || `HTTP ${res.status}`;
-      return jsonResponse({ error: `Groq: ${message}` }, res.status);
+    // Groq (a diferencia de Gemini) no usa un schema JSON estricto, así que
+    // a veces omite campos (sobre todo hashtags) aunque el prompt los pida.
+    // Si el único problema es de CALIDAD (no de cuota/red/HTTP), reforzamos
+    // la instrucción explícitamente y reintentamos una vez — hay margen de
+    // tiempo de sobra porque esta función ya no comparte presupuesto con
+    // Gemini (cada una tiene sus ~9s propios).
+    if (!result.ok && result.status !== 429 && /no cumple los estándares de calidad/.test(result.error || "")) {
+      const reinforcedPrompt = basePrompt + `
+
+RECORDATORIO CRÍTICO — tu respuesta anterior falló esta validación: "${result.error}"
+Antes de responder, verifica tú mismo que el JSON final tenga TODOS estos campos sin excepción:
+- "headline": string no vacío.
+- "body": con 2 saltos de línea dobles formando 3 bloques (párrafo, dato/opinión, pregunta de cierre), mínimo 25 palabras.
+- "hashtags": un ARRAY con ENTRE 5 Y 8 strings, cada uno iniciando con #. Este campo es OBLIGATORIO y NUNCA puede quedar vacío ni faltar.`;
+      result = await callGroqOnce(reinforcedPrompt, groqKey, controller.signal);
     }
 
-    const rawText = json?.choices?.[0]?.message?.content;
-    if (!rawText) {
-      return jsonResponse({ error: "Groq no devolvió contenido." }, 502);
-    }
-
-    const result = parsePostJSON(rawText, "Groq");
     if (!result.ok) {
       return jsonResponse({ error: result.error }, result.status || 502);
     }
@@ -81,3 +69,37 @@ exports.handler = async (event) => {
     clearTimeout(timeout);
   }
 };
+
+async function callGroqOnce(prompt, groqKey, signal) {
+  const payload = {
+    model: GROQ_MODEL,
+    messages: [{ role: "user", content: prompt }],
+    temperature: 1.05,
+    top_p: 0.95,
+    max_tokens: 2048,
+    response_format: { type: "json_object" }
+  };
+
+  const res = await fetch(GROQ_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${groqKey}`
+    },
+    body: JSON.stringify(payload),
+    signal
+  });
+  const json = await res.json().catch(() => ({}));
+
+  if (!res.ok) {
+    const message = json?.error?.message || `HTTP ${res.status}`;
+    return { ok: false, error: `Groq: ${message}`, status: res.status };
+  }
+
+  const rawText = json?.choices?.[0]?.message?.content;
+  if (!rawText) {
+    return { ok: false, error: "Groq no devolvió contenido.", status: 502 };
+  }
+
+  return parsePostJSON(rawText, "Groq");
+}
