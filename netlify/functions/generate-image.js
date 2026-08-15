@@ -5,10 +5,27 @@
 //   - Si hay imagen OFICIAL real disponible (portada de MAL, cover de IGDB,
 //     imagen del RSS) -> se EDITA/mejora con @cf/runwayml/stable-diffusion-
 //     v1-5-img2img, conservando el contenido original, solo mejorando
-//     nitidez/composición.
+//     nitidez/composición/color.
 //   - Si no hay imagen oficial -> se GENERA desde cero con
 //     @cf/black-forest-labs/flux-1-schnell, sin pedir nunca personajes con
 //     nombre propio o IP reconocible.
+//
+// SOBRE LA CALIDAD DE LA EDICIÓN: @cf/runwayml/stable-diffusion-v1-5-img2img
+// es, a la fecha, el ÚNICO modelo de Cloudflare Workers AI que (a) acepta una
+// imagen de entrada para editar y (b) sigue etiquetado "Beta" -> gratis e
+// ilimitado dentro del pool de Neurons (los modelos más nuevos de edición
+// unificada, como flux-2-klein, son modelos "Partner" con precio por tile,
+// NO cubiertos por el tier gratuito). Es un modelo de 2024 y no entiende el
+// contenido semánticamente como los modelos multimodales modernos: solo
+// difunde ruido guiado por el prompt sobre la imagen de entrada. Por eso:
+//   - `strength` se mantiene BAJO (ver STRENGTH_EDIT) para que el resultado
+//     se quede cerca de la imagen real en vez de "reinventarla" — el
+//     objetivo es mejorar nitidez/color, no transformar el contenido.
+//   - `num_steps` va al máximo que permite el modelo (20) para la mejor
+//     calidad posible dentro de este modelo.
+//   - El prompt de edición es deliberadamente conservador (ver
+//     buildEditPrompt): pide explícitamente PRESERVAR la composición y el
+//     sujeto, no reinterpretarlos.
 //
 // MANEJO DE SATURACIÓN (error 3040 "Capacity temporarily exceeded"): es un
 // error transitorio de Cloudflare (no de esta cuenta ni de sus créditos:
@@ -17,20 +34,21 @@
 //   1. Reintenta una vez de inmediato contra Cloudflare (dentro del mismo
 //      presupuesto de 9s), ya que a veces el siguiente intento cae en otro
 //      datacenter con capacidad libre.
-//   2. Si el intento era de EDICIÓN y sigue sin capacidad, cae una vez a
-//      GENERAR desde cero con FLUX en vez de editar (FLUX suele tener mejor
-//      disponibilidad al ser menos usado que el modelo de edición), para
-//      devolver algo en vez de nada.
-//   3. Si aun así falla, devuelve capacityError:true para que el FRONTEND
-//      reintente con espera larga (varios minutos) en vez de rendirse,
-//      porque Netlify free corta esta función a los 10s y no hay margen
-//      para un backoff largo aquí.
+//   2. Si aun así falla, devuelve capacityError:true para que el FRONTEND
+//      reintente con espera larga (varios minutos), y si se agota ese
+//      tiempo, use su propio respaldo con Canvas 2D (sin IA) que SÍ
+//      conserva la imagen oficial. Cuando la solicitud era de EDICIÓN
+//      (había imagen oficial), esta función NUNCA cae a generar una
+//      ilustración desde cero como sustituto silencioso: eso reemplazaría
+//      la imagen real de la noticia por arte inventado sin avisar.
 //
-// POR QUÉ CLOUDFLARE Y NO GEMINI: la API de Gemini no tiene cuota gratuita
-// para generación de imágenes vía API (ni gemini-2.5-flash-image ni
-// gemini-3.x-flash-image la tienen; su Free Tier aparece como "Not
-// available" en la página oficial de precios) — solo Cloudflare Workers AI
-// ofrece hoy un tier gratuito real para esto, con reseteo diario.
+// POR QUÉ CLOUDFLARE Y NO GEMINI/OTROS: a la fecha, ningún proveedor con
+// modelos de edición de imagen que SÍ entienden contenido semánticamente
+// (Gemini 3.1 Flash Image, etc.) ofrece tier gratuito para generación de
+// imágenes vía API — todos cobran por imagen. Cloudflare Workers AI es hoy
+// la única opción con tier gratuito real para esto. Si en el futuro se
+// decide asumir un costo mínimo (unos centavos por imagen), migrar a un
+// modelo multimodal de edición real sería el siguiente paso natural.
 //
 // NOTA SOBRE COPYRIGHT: a diferencia de Gemini, los modelos de Stable
 // Diffusion/FLUX en Cloudflare no traen un filtro de seguridad explícito
@@ -54,6 +72,16 @@
 const CF_BASE = "https://api.cloudflare.com/client/v4/accounts";
 const MODEL_GENERATE = "@cf/black-forest-labs/flux-1-schnell";
 const MODEL_EDIT = "@cf/runwayml/stable-diffusion-v1-5-img2img";
+
+// Cuánto se permite que el modelo se aleje de la imagen de entrada durante
+// la edición (0 = idéntica a la original, 1 = ignora la original). Antes
+// estaba en 0.55, que en la práctica reinterpreta bastante la imagen. Se
+// baja a 0.30 para que el resultado se quede fiel al contenido real
+// (mismo personaje/escena/composición) y el cambio se note solo en
+// nitidez, color y detalle — que es lo que se pidió: "editar la imagen
+// oficial, mejorar calidad y colores", no generar una versión distinta.
+const STRENGTH_EDIT = 0.30;
+const NUM_STEPS_EDIT = 20; // máximo permitido por este modelo
 
 // Presupuesto de tiempo: Netlify corta a los 10s (plan gratuito). Descargar
 // la imagen fuente + llamar a Cloudflare comparten este presupuesto.
@@ -88,7 +116,14 @@ exports.handler = async (event) => {
 
   try {
     let sourceImageB64 = null;
-    if (sourceImageUrl && typeof sourceImageUrl === "string") {
+    // Solo se acepta una URL http(s) real como imagen fuente para editar.
+    // Si llega un data: URL (por ejemplo, si el frontend accidentalmente
+    // reenviara una imagen ya procesada en vez de la URL pública original),
+    // se ignora aquí y la solicitud cae a modo GENERAR desde cero en vez de
+    // editar sobre una imagen que ya no es la oficial. Esto blinda en el
+    // backend la regla de que la edición parte siempre de la foto real,
+    // nunca de un resultado previo de la IA o del respaldo local.
+    if (sourceImageUrl && typeof sourceImageUrl === "string" && /^https?:\/\//i.test(sourceImageUrl)) {
       sourceImageB64 = await tryFetchImageAsBase64(sourceImageUrl).catch(() => null);
     }
 
@@ -101,8 +136,12 @@ exports.handler = async (event) => {
     let payload = { prompt };
     if (usedSourceImage) {
       payload.image_b64 = sourceImageB64;
-      payload.strength = 0.55;
-      payload.num_steps = 20;
+      payload.strength = STRENGTH_EDIT;
+      payload.num_steps = NUM_STEPS_EDIT;
+      // Refuerza en negativo lo que el prompt positivo ya pide preservar:
+      // evita que el modelo "invente" un personaje, escena o estilo
+      // distintos al de la imagen real que se está editando.
+      payload.negative_prompt = "different character, different subject, different scene, altered composition, reinterpreted content, changed pose, low quality, blurry, distorted, watermark, text";
     } else {
       payload.width = 864;
       payload.height = 1080;
@@ -135,24 +174,15 @@ exports.handler = async (event) => {
       }
     }
 
-    // Si la EDICIÓN (img2img) sigue sin capacidad tras el reintento, se
-    // prueba UNA vez, dentro del mismo presupuesto de tiempo, generar desde
-    // cero con FLUX en vez de editar. FLUX suele tener mejor disponibilidad
-    // que el modelo de edición porque lo usan menos proyectos gratuitos, así
-    // que en el peor caso el usuario recibe una ilustración generada en vez
-    // de la edición de su imagen oficial, en lugar de ningún resultado.
-    if (!res.ok && res.status === 429 && usedSourceImage) {
-      const errJsonPeek2 = await res.clone().json().catch(() => ({}));
-      const code2 = errJsonPeek2?.errors?.[0]?.code;
-      if (code2 === 3040 || !code2) {
-        usedSourceImage = false;
-        model = MODEL_GENERATE;
-        prompt = buildGeneratePrompt({ title, category, postType, summary });
-        payload = { prompt, width: 864, height: 1080 };
-        res = await callCloudflare();
-      }
-    }
-
+    // IMPORTANTE: si la solicitud es de EDICIÓN (había imagen oficial) y
+    // sigue sin capacidad tras el reintento, YA NO se cae a generar desde
+    // cero con FLUX. Hacerlo sustituía en silencio la imagen oficial de la
+    // publicación por una ilustración inventada sin avisar — el usuario veía
+    // "Mejorar con IA" y terminaba con una imagen que no tenía nada que ver
+    // con la noticia real. Ahora, si la edición no tiene capacidad, se
+    // devuelve el error de capacidad tal cual (capacityError:true) para que
+    // el FRONTEND use su propio respaldo con Canvas 2D
+    // (composeLocalFallbackImage), que sí conserva la imagen oficial.
     const contentType = res.headers.get("content-type") || "";
 
     if (!res.ok) {
@@ -225,9 +255,15 @@ const CATEGORY_STYLE = {
   curiosidades: "ilustración temática otaku, estilo pop art anime, colores llamativos"
 };
 
+// Prompt deliberadamente conservador: junto con STRENGTH_EDIT bajo, el
+// objetivo es que el modelo perciba esto como "restaurar/pulir la imagen
+// que ya existe", no como "reinterpretarla libremente". Se nombra
+// explícitamente qué se debe preservar (sujeto, pose, encuadre) antes de
+// pedir la mejora, porque Stable Diffusion 1.5 tiende a ignorar
+// instrucciones negativas o implícitas si no están dichas primero.
 function buildEditPrompt({ category }) {
   const style = CATEGORY_STYLE[category] || CATEGORY_STYLE.anime;
-  return `high quality, sharp, detailed, ${style}, professional social media cover art, clean composition, vertical portrait format`;
+  return `same subject, same pose, same composition, same framing, preserve original content exactly, only enhance: sharper details, richer color grading, improved lighting and contrast, higher fidelity, ${style}, professional social media cover quality, vertical portrait format`;
 }
 
 function buildGeneratePrompt({ category }) {
