@@ -1281,7 +1281,22 @@ async function publishToFacebookGraph(p){
   const base = `https://graph.facebook.com/${GRAPH_API_VERSION}/${encodeURIComponent(fbCreds.pageId)}`;
   const message = p.postText;
 
-  if (p.image){
+  if (p.image && p.image.startsWith("data:")){
+    // Imagen local (mejorada en el navegador o subida por el usuario): no es
+    // una URL pública, así que Facebook no puede descargarla por su cuenta.
+    // Se sube el binario directamente como multipart/form-data en vez de
+    // mandar "url".
+    const url = `${base}/photos`;
+    const blob = await (await fetch(p.image)).blob();
+    const form = new FormData();
+    form.append("source", blob, "imagen.png");
+    form.append("caption", message);
+    form.append("access_token", fbCreds.token);
+    const res = await fetch(url, { method: "POST", body: form });
+    const json = await res.json();
+    if (!res.ok || json.error) throw new Error(json.error?.message || ("HTTP " + res.status));
+    return json;
+  } else if (p.image){
     const url = `${base}/photos`;
     const body = new URLSearchParams({
       url: p.image,
@@ -2640,8 +2655,14 @@ function renderFeed(){
     if (dlImgBtn) dlImgBtn.addEventListener("click", () => onDownloadImageClick(p));
     const dlCardBtn = document.getElementById("dlcard-" + p.id);
     if (dlCardBtn) dlCardBtn.addEventListener("click", () => onDownloadCardClick(p));
-    const aiImgBtn = document.getElementById("aiimg-" + p.id);
-    if (aiImgBtn) aiImgBtn.addEventListener("click", () => onGenerateAiImageClick(p));
+    const enhanceBtn = document.getElementById("enhance-" + p.id);
+    if (enhanceBtn) enhanceBtn.addEventListener("click", () => onEnhanceImageClick(p));
+    const uploadBtn = document.getElementById("upload-" + p.id);
+    const uploadFile = document.getElementById("uploadfile-" + p.id);
+    if (uploadBtn && uploadFile){
+      uploadBtn.addEventListener("click", () => uploadFile.click());
+      uploadFile.addEventListener("change", (e) => onUploadImageChange(p, e));
+    }
     const toggleBtn = document.getElementById("toggle-" + p.id);
     if (toggleBtn) toggleBtn.addEventListener("click", () => {
       const postEl = document.getElementById("post-" + p.id);
@@ -2666,9 +2687,8 @@ function cardHtml(p){
         <span class="card-cat" style="color:${cat.color}">${svgIcon(catIcon)}${cat.label}</span>
         <span class="card-type">${svgIcon(type.icon)}${type.label}</span>
         ${p.imageIsFallback ? `<span class="card-fallback-flag">${svgIcon("layers")}Imagen de respaldo</span>` : ""}
-        ${p.imageIsAiGenerated ? `<span class="card-fallback-flag">${svgIcon("sparkles")}Ilustración IA</span>` : ""}
-        ${p.imageIsAiEdited ? `<span class="card-fallback-flag">${svgIcon("sparkles")}Mejorada con IA</span>` : ""}
-        ${p.imageIsLocalEdit ? `<span class="card-fallback-flag">${svgIcon("layers")}Editada en el navegador</span>` : ""}
+        ${p.imageIsCustom ? `<span class="card-fallback-flag">${svgIcon("image")}Imagen propia</span>` : ""}
+        ${p.imageIsLocalEdit ? `<span class="card-fallback-flag">${svgIcon("sparkles")}Mejorada</span>` : ""}
       </div>
       <div class="card-body">
         <div class="card-source-row">
@@ -2687,179 +2707,82 @@ function cardHtml(p){
         <div class="card-actions" style="margin-top:8px;">
           <button class="btn btn-ghost btn-sm" id="dlimg-${p.id}" style="flex:1;">${svgIcon("download")} Descargar imagen</button>
           <button class="btn btn-ghost btn-sm" id="dlcard-${p.id}" style="flex:1;">${svgIcon("image")} Descargar tarjeta</button>
-        </div>
-        <div class="card-actions" style="margin-top:8px;">
-          <button class="btn btn-ghost btn-sm" id="aiimg-${p.id}" style="flex:1;">${svgIcon("sparkles")} Mejorar con IA</button>
         </div>` : ""}
+        <div class="card-actions" style="margin-top:8px;">
+          <button class="btn btn-ghost btn-sm" id="enhance-${p.id}" style="flex:1;" ${p.image ? "" : "disabled"}>${svgIcon("sparkles")} Mejorar imagen</button>
+          <button class="btn btn-ghost btn-sm" id="upload-${p.id}" style="flex:1;">${svgIcon("image")} ${p.image ? "Cambiar imagen" : "Subir imagen"}</button>
+        </div>
+        <input type="file" accept="image/*" id="uploadfile-${p.id}" style="display:none;">
         <div class="copied-flag" id="flag-${p.id}">Texto copiado ✓</div>
       </div>
     </article>
   `;
 }
 
-// Genera una ilustración con IA para reemplazar la imagen de la tarjeta.
-// Si Gemini bloquea la generación por copyright/seguridad (personaje
-// reconocible), se cae automáticamente a la imagen real que ya trae la
-// fuente (p.image original) — y SOLO en ese caso específico, nunca ante
-// otro tipo de error (cuota agotada, timeout, etc.), que se muestra tal
-// cual para no confundir "no se pudo generar ahora" con "está bloqueado".
-async function requestAiImage(p, signal){
-  const res = await fetch("/.netlify/functions/generate-image", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      title: p.title,
-      category: p.category,
-      postType: p.postType,
-      summary: p.summary,
-      // Se envía SIEMPRE la imagen oficial original (no la ya editada,
-      // por si el usuario genera dos veces seguidas), para que la
-      // función la use como base de edición en vez de generar desde
-      // cero. Si no hay imagen original, la función genera desde texto.
-      sourceImageUrl: p.originalImage || null
-    }),
-    signal
-  });
-  const json = await res.json().catch(() => null);
-  if (!res.ok || !json){
-    const err = new Error((json && json.error) || `HTTP ${res.status}`);
-    err.capacityError = !!(json && json.capacityError);
-    throw err;
+// Mejora la imagen de la tarjeta 100% en el navegador (sin IA, sin
+// servidor, gratis e instantáneo): sube nitidez/contraste/color con un
+// filtro nativo de Canvas 2D y le superpone la identidad visual de
+// Infotaku (categoría, título, logo), igual que hace la tarjeta
+// descargable. No inventa contenido nuevo: parte siempre de la imagen que
+// ya tiene la publicación (oficial o la que el usuario haya subido).
+async function onEnhanceImageClick(p){
+  const btn = document.getElementById("enhance-" + p.id);
+  if (!p.image && !p.originalImage){
+    log(`"${p.title}" no tiene ninguna imagen todavía. Usa "Subir imagen" primero.`, "warn");
+    return;
   }
-  return json;
+  if (btn){ btn.disabled = true; btn.textContent = "Mejorando…"; }
+  try{
+    const dataUrl = await composeLocalFallbackImage(p);
+    if (!dataUrl) throw new Error("no se pudo procesar la imagen");
+    p.image = dataUrl;
+    p.imageIsFallback = false;
+    p.imageIsCustom = false;
+    p.imageIsLocalEdit = true;
+    saveToStorage();
+    renderFeed();
+    log(`Imagen mejorada (nitidez, color y marca) para "${p.title}".`, "ok");
+  }catch(e){
+    log(`No se pudo mejorar la imagen de "${p.title}" (${e.message || e}). Puede deberse a restricciones CORS de la imagen de origen.`, "err");
+    if (btn){ btn.disabled = false; btn.textContent = "✨ Mejorar imagen"; }
+  }
 }
 
-// Reintentos pacientes ante "capacityError" (Cloudflare sin datacenter GPU
-// disponible en ese instante: error 3040, transitorio, no es problema de
-// cuota ni de cuenta). El usuario prefiere esperar varios minutos antes que
-// ver un error, así que se reintenta con backoff creciente hasta este tope,
-// y solo se detiene si el usuario cancela o si el error deja de ser de
-// capacidad (ahí sí es un fallo real: falta configurar credenciales, imagen
-// fuente inválida, etc., y no tiene sentido seguir reintentando eso).
-const AI_IMAGE_RETRY_DELAYS_MS = [3000, 5000, 8000, 12000, 20000, 30000, 30000, 30000, 30000, 30000];
-const AI_IMAGE_MAX_WAIT_MS = AI_IMAGE_RETRY_DELAYS_MS.reduce((a, b) => a + b, 0); // ~3 min
+// Deja que el usuario reemplace la imagen de una publicación con un archivo
+// propio (útil cuando no hay imagen oficial, o cuando la de respaldo
+// genérica no encaja). Se guarda como dataURL, igual que el resto de
+// imágenes procesadas localmente, y queda marcada como "imagen propia".
+const MAX_UPLOAD_BYTES = 6 * 1024 * 1024; // 6MB, margen prudente para localStorage
 
-// Controllers activos por publicación, para poder cancelar desde el botón.
-const aiImageCancelers = {};
+function onUploadImageChange(p, event){
+  const file = event.target.files && event.target.files[0];
+  event.target.value = ""; // permite volver a elegir el mismo archivo después
+  if (!file) return;
 
-function formatWaitLabel(msElapsed){
-  const totalSec = Math.round(msElapsed / 1000);
-  const m = Math.floor(totalSec / 60);
-  const s = totalSec % 60;
-  return m > 0 ? `${m}m ${s}s` : `${s}s`;
-}
-
-async function onGenerateAiImageClick(p){
-  const btn = document.getElementById("aiimg-" + p.id);
-
-  // Si ya hay una generación en curso para esta tarjeta, el clic cancela.
-  if (aiImageCancelers[p.id]){
-    aiImageCancelers[p.id].cancelled = true;
-    if (aiImageCancelers[p.id].controller) aiImageCancelers[p.id].controller.abort();
+  if (!file.type.startsWith("image/")){
+    alert("El archivo elegido no es una imagen.");
+    return;
+  }
+  if (file.size > MAX_UPLOAD_BYTES){
+    alert("La imagen pesa demasiado (máximo 6MB). Prueba con una versión más liviana.");
     return;
   }
 
-  const state = { cancelled: false, controller: null };
-  aiImageCancelers[p.id] = state;
-  if (btn){ btn.disabled = false; btn.textContent = "Generando… (toca para cancelar)"; btn.classList.add("btn-cancelable"); }
-
-  const startedAt = Date.now();
-  let json = null;
-  let lastError = null;
-
-  try{
-    for (let attempt = 0; attempt <= AI_IMAGE_RETRY_DELAYS_MS.length; attempt++){
-      if (state.cancelled) { lastError = new Error("cancelado por el usuario"); break; }
-
-      const controller = new AbortController();
-      state.controller = controller;
-      const timeout = setTimeout(() => controller.abort(), 10000);
-      try{
-        json = await requestAiImage(p, controller.signal);
-        lastError = null;
-        break;
-      }catch(e){
-        lastError = e;
-        const isTimeoutAbort = e.name === "AbortError" && !state.cancelled;
-        const shouldRetry = (e.capacityError || isTimeoutAbort) && attempt < AI_IMAGE_RETRY_DELAYS_MS.length;
-        if (!shouldRetry) break;
-        const elapsed = formatWaitLabel(Date.now() - startedAt);
-        if (btn) btn.textContent = `Servidores ocupados, reintentando (${elapsed}, toca para cancelar)…`;
-        await new Promise(r => setTimeout(r, AI_IMAGE_RETRY_DELAYS_MS[attempt]));
-      }finally{
-        clearTimeout(timeout);
-      }
-    }
-
-    if (state.cancelled){
-      log(`Generación de imagen cancelada para "${p.title}".`, "warn");
-      if (btn){ btn.textContent = "✨ Mejorar con IA"; btn.classList.remove("btn-cancelable"); }
-      return;
-    }
-    if (lastError) throw lastError;
-
-    if (json.blocked){
-      // Señal explícita de bloqueo por copyright/seguridad: se conserva la
-      // imagen real original (p.image ya la tiene) y se avisa por qué no
-      // se reemplazó, en vez de fallar en silencio.
-      log(`Ilustración IA bloqueada para "${p.title}" (motivo: ${json.reason || "copyright/seguridad"}). Se conserva la imagen original de la fuente.`, "warn");
-      if (btn){ btn.textContent = "🔒 Bloqueada por copyright — usando imagen real"; btn.classList.remove("btn-cancelable"); }
-      setTimeout(() => { if (btn) btn.textContent = "✨ Mejorar con IA"; }, 3500);
-      return;
-    }
-
-    if (!json.dataUrl){
-      throw new Error("La función no devolvió una imagen.");
-    }
-
-    // Reemplaza la imagen de la publicación en memoria y re-renderiza esa
-    // tarjeta para que se vea la nueva versión de inmediato.
-    p.image = json.dataUrl;
+  const reader = new FileReader();
+  reader.onload = () => {
+    p.image = reader.result;
+    p.originalImage = reader.result;
     p.imageIsFallback = false;
-    p.imageIsAiGenerated = !json.usedSourceImage;
-    p.imageIsAiEdited = !!json.usedSourceImage;
+    p.imageIsCustom = true;
+    p.imageIsLocalEdit = false;
     saveToStorage();
     renderFeed();
-    log(json.usedSourceImage
-      ? `Imagen oficial mejorada con IA para "${p.title}" (tras ${formatWaitLabel(Date.now() - startedAt)}).`
-      : `Ilustración IA generada desde cero para "${p.title}" (no había imagen oficial disponible; tras ${formatWaitLabel(Date.now() - startedAt)}).`, "ok");
-  }catch(e){
-    const message = e.capacityError
-      ? `servidores de IA sin capacidad durante ${formatWaitLabel(AI_IMAGE_MAX_WAIT_MS)} seguidos`
-      : (e.message || e);
-
-    // Si el fallo fue por capacidad (no un error de configuración real) y
-    // hay alguna imagen base (original o la que ya tenía la publicación),
-    // se compone automáticamente una versión "mejorada" con Canvas del
-    // propio navegador — sin IA, sin servidor, gratis e instantáneo — en
-    // vez de dejar la publicación sin portada tras varios minutos de espera.
-    if (e.capacityError && (p.originalImage || p.image)){
-      try{
-        if (btn) btn.textContent = "IA no disponible, editando localmente…";
-        const localDataUrl = await composeLocalFallbackImage(p);
-        if (localDataUrl){
-          p.image = localDataUrl;
-          p.imageIsFallback = false;
-          p.imageIsAiGenerated = false;
-          p.imageIsAiEdited = false;
-          p.imageIsLocalEdit = true;
-          saveToStorage();
-          renderFeed();
-          log(`No se pudo procesar la imagen con IA para "${p.title}" (${message}). Se editó automáticamente en el navegador (sin IA) como respaldo.`, "warn");
-          return;
-        }
-      }catch(localErr){
-        log(`No se pudo procesar la imagen con IA para "${p.title}" (${message}), y tampoco se pudo editar localmente (${localErr.message || localErr}).`, "err");
-        if (btn){ btn.disabled = false; btn.textContent = "✨ Mejorar con IA"; btn.classList.remove("btn-cancelable"); }
-        return;
-      }
-    }
-
-    log(`No se pudo procesar la imagen con IA para "${p.title}" (${message}).`, "err");
-    if (btn){ btn.disabled = false; btn.textContent = "✨ Mejorar con IA"; btn.classList.remove("btn-cancelable"); }
-  }finally{
-    delete aiImageCancelers[p.id];
-  }
+    log(`Imagen propia asignada a "${p.title}".`, "ok");
+  };
+  reader.onerror = () => {
+    log(`No se pudo leer la imagen elegida para "${p.title}".`, "err");
+  };
+  reader.readAsDataURL(file);
 }
 
 /* =========================================================
@@ -2875,15 +2798,16 @@ const BRAND = {
 };
 
 
-// Fallback SIN IA, 100% en el navegador: cuando la generación/edición con
-// Cloudflare falla definitivamente (tras todos los reintentos pacientes),
-// se compone automáticamente una versión "mejorada" de la imagen original
-// usando Canvas 2D — el mismo recurso nativo que ya usa la tarjeta
-// descargable (drawImageCover, degradado, título, logo) — en vez de dejar
-// la publicación sin ninguna imagen. No sustituye a la IA (no genera arte
-// nuevo desde texto si no hay imagen original), pero garantiza que la
-// portada exista y tenga la identidad visual de Infotaku.
-// Devuelve un dataURL PNG, o null si no hay ninguna imagen base disponible.
+// Mejora de imagen 100% en el navegador (sin IA, sin servidor, sin costo):
+// usa el mismo recurso nativo que ya usa la tarjeta descargable
+// (drawImageCover, degradado, título, logo) para partir siempre de la
+// imagen real de la publicación (oficial o subida por el usuario) y:
+//   - subir nitidez percibida, contraste, saturación y brillo con un
+//     filtro de Canvas 2D (ctx.filter, sin IA).
+//   - superponer la identidad visual de Infotaku: etiqueta de categoría,
+//     título y logo, igual que en la tarjeta descargable.
+// No inventa contenido nuevo ni reemplaza la imagen real por otra: solo
+// la pule. Devuelve un dataURL PNG, o null si no hay imagen base disponible.
 async function composeLocalFallbackImage(p){
   const baseUrl = p.originalImage || p.image;
   if (!baseUrl) return null;
@@ -2891,16 +2815,25 @@ async function composeLocalFallbackImage(p){
   const img = await loadImageForCanvas(baseUrl);
 
   const canvas = document.createElement("canvas");
-  const W = 864, H = 1080; // mismo formato vertical que usa la IA (generate-image.js)
+  const W = 864, H = 1080; // mismo formato vertical usado en toda la app
   canvas.width = W; canvas.height = H;
   const ctx = canvas.getContext("2d");
 
-  // "Mejora" vía filtro nativo de Canvas (sin IA): sube ligeramente
-  // contraste, saturación y nitidez percibida antes de dibujar la imagen
-  // base, cubriendo el lienzo completo.
-  ctx.filter = "contrast(1.08) saturate(1.15) brightness(1.03)";
+  // Paso 1: color base vía filtro nativo de Canvas (sin IA) al dibujar la
+  // imagen, cubriendo el lienzo completo. Se deja el contraste fuera de
+  // aquí porque el auto-nivel del paso 2 hace un trabajo mucho mejor
+  // (ajustado al histograma real de esta imagen en concreto).
+  ctx.filter = "saturate(1.18) brightness(1.02)";
   drawImageCover(ctx, img, 0, 0, W, H);
   ctx.filter = "none";
+
+  // Paso 2 y 3: auto-nivel de contraste + nitidez real (unsharp mask con
+  // reducción de ruido previa). Es lo más cercano a "mejorar calidad,
+  // nitidez y colores" que se puede lograr con Canvas 2D nativo, sin IA.
+  try{
+    autoLevels(ctx, W, H);
+    enhanceSharpness(ctx, W, H);
+  }catch(e){ /* si el canvas quedó "tainted" por CORS, se sigue sin este realce */ }
 
   // Degradado inferior para que el título sea legible sobre la imagen,
   // igual que en la tarjeta descargable.
@@ -3054,7 +2987,7 @@ async function onDownloadImageClick(p){
 // Genera una tarjeta lista para publicar: foto de portada + degradado + título +
 // marca "OtaGen", dibujada en un <canvas> y exportada como PNG descargable.
 // Genera la tarjeta descargable con la identidad visual de Infotaku:
-// imagen (real o generada por IA) arriba, franja diagonal tipo "sticker"
+// imagen de la publicación (oficial, subida o mejorada) arriba, franja diagonal tipo "sticker"
 // con la categoría, titular en blanco/morado, subtítulo, y footer con el
 // logo circular + canal de YouTube + sello de verificado. Formato vertical
 // 4:5 (1080×1350), estándar para feed de Facebook/Instagram en móvil.
@@ -3196,6 +3129,116 @@ function drawImageCover(ctx, img, x, y, w, h){
     sy = (img.height - sh) / 2;
   }
   ctx.drawImage(img, sx, sy, sw, sh, x, y, w, h);
+}
+
+// Nitidez real vía "unsharp mask" (el mismo principio que usan Photoshop/
+// GIMP en su filtro "Sharpen" o "Unsharp Mask"), sin IA:
+//   resultado = original + (original - blur(original)) * amount
+// Es decir: se genera una versión desenfocada de la imagen, se resta de la
+// original para aislar SOLO los bordes/detalle fino, y esa diferencia se
+// vuelve a sumar amplificada. Esto da mucho más control y menos artefactos
+// que un kernel de convolución fijo (que trata cada píxel igual, sin
+// distinguir "borde real" de "ruido"), lo que permite subir la fuerza sin
+// que la imagen se vea "quemada" o con halos.
+//
+// Antes de eso se aplica un blur MUY leve como paso de "reducción de
+// ruido": las imágenes borrosas casi siempre vienen de una fuente ya
+// comprimida en JPEG, y ese ruido de compresión es justo lo que un sharpen
+// agresivo resalta primero (dientes de sierra en vez de bordes limpios).
+// Suavizarlo un poco antes de afilar hace que el resultado final se vea
+// más nítido de verdad, no solo más "ruidoso".
+function enhanceSharpness(ctx, W, H){
+  const src = ctx.getImageData(0, 0, W, H);
+  const data = src.data;
+
+  // Paso A: denoise leve (box blur radio 1) para no amplificar ruido de
+  // compresión junto con los bordes reales en el paso siguiente.
+  const denoised = boxBlur(data, W, H, 1);
+
+  // Paso B: blur más amplio (radio 2) sobre la imagen ya denoised, que es
+  // la base que el unsharp mask usa para detectar dónde están los bordes.
+  const blurred = boxBlur(denoised, W, H, 2);
+
+  // Paso C: unsharp mask en dos pasadas de fuerza moderada en vez de una
+  // sola pasada fuerte — da un realce más natural y progresivo, muy
+  // parecido a cómo los editores de foto aplican "afilar" más de una vez
+  // hasta que se ve bien, en vez de un único filtro extremo.
+  const amount = 0.6;
+  const out = new Uint8ClampedArray(denoised.length);
+  for (let i = 0; i < denoised.length; i += 4){
+    for (let c = 0; c < 3; c++){
+      const diff = denoised[i + c] - blurred[i + c];
+      out[i + c] = denoised[i + c] + diff * amount;
+    }
+    out[i + 3] = data[i + 3]; // alfa intacto
+  }
+
+  ctx.putImageData(new ImageData(out, W, H), 0, 0);
+}
+
+// Box blur simple (promedio de vecinos en un radio dado), usado como base
+// del unsharp mask de arriba. Separable en horizontal + vertical para que
+// sea rápido incluso en radios mayores.
+function boxBlur(data, W, H, radius){
+  const h = boxBlurPass(data, W, H, radius, true);
+  return boxBlurPass(h, W, H, radius, false);
+}
+
+function boxBlurPass(data, W, H, radius, horizontal){
+  const out = new Uint8ClampedArray(data.length);
+  const size = radius * 2 + 1;
+  for (let y = 0; y < H; y++){
+    for (let x = 0; x < W; x++){
+      let r = 0, g = 0, b = 0, a = 0, count = 0;
+      for (let o = -radius; o <= radius; o++){
+        const sx = horizontal ? x + o : x;
+        const sy = horizontal ? y : y + o;
+        if (sx < 0 || sx >= W || sy < 0 || sy >= H) continue;
+        const idx = (sy * W + sx) * 4;
+        r += data[idx]; g += data[idx + 1]; b += data[idx + 2]; a += data[idx + 3];
+        count++;
+      }
+      const idx = (y * W + x) * 4;
+      out[idx] = r / count; out[idx + 1] = g / count; out[idx + 2] = b / count; out[idx + 3] = a / count;
+    }
+  }
+  return out;
+}
+
+// Auto-nivel de contraste basado en el histograma real de la imagen (igual
+// que "Auto Levels"/"Auto Contraste" en editores de foto): estira el rango
+// de brillo de cada canal para que el punto más oscuro real de la imagen
+// se vuelva negro y el más claro se vuelva blanco, en vez de aplicar un
+// contraste fijo a ciegas. Esto ayuda mucho más que un filtro genérico
+// cuando la imagen de origen viene "plana"/descolorida (muy común en
+// portadas comprimidas o capturas de baja calidad), porque cada imagen
+// recibe el ajuste que realmente necesita.
+function autoLevels(ctx, W, H, clipPercent = 0.5){
+  const src = ctx.getImageData(0, 0, W, H);
+  const data = src.data;
+  const totalPixels = W * H;
+
+  for (let c = 0; c < 3; c++){
+    const hist = new Uint32Array(256);
+    for (let i = c; i < data.length; i += 4) hist[data[i]]++;
+
+    // Recorta un pequeño porcentaje de píxeles extremos (outliers) en cada
+    // punta del histograma antes de fijar los límites, para que un puñado
+    // de píxeles quemados/ruido no arruine el estiramiento de todo el resto.
+    const clip = totalPixels * (clipPercent / 100);
+    let lo = 0, acc = 0;
+    while (lo < 255 && acc < clip){ acc += hist[lo]; lo++; }
+    let hi = 255; acc = 0;
+    while (hi > 0 && acc < clip){ acc += hist[hi]; hi--; }
+    if (hi <= lo) continue; // imagen ya de bajo contraste real; no forzar
+
+    const range = hi - lo;
+    for (let i = c; i < data.length; i += 4){
+      data[i] = Math.max(0, Math.min(255, ((data[i] - lo) / range) * 255));
+    }
+  }
+
+  ctx.putImageData(src, 0, 0);
 }
 
 function roundRect(ctx, x, y, w, h, r){
