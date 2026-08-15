@@ -16,10 +16,14 @@
 
 const { parseAndValidateItem, buildPrompt, parsePostJSON, jsonResponse } = require("./_post-shared");
 
-// Modelo gratuito de OpenRouter. Se puede cambiar por otro ":free" del
-// catálogo (openrouter.ai/models?max_price=0) si este deja de estar
-// disponible o rinde peor con este prompt específico.
-const OPENROUTER_MODEL = "deepseek/deepseek-chat-v3.1:free";
+// Modelo gratuito de OpenRouter. Se usa el router propio de OpenRouter
+// (openrouter/free) en vez de fijar un modelo ":free" concreto: ese router
+// selecciona automáticamente, en cada llamada, un modelo gratuito disponible
+// que soporte los features pedidos (aquí, response_format json_object),
+// evitando que la función se rompa cuando un modelo puntual deje de ser
+// gratuito o se retire del catálogo (como pasó con
+// "deepseek/deepseek-chat-v3.1:free"). Doc: https://openrouter.ai/docs/guides/routing/routers/free-router
+const OPENROUTER_MODEL = "openrouter/free";
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 
 // Presupuesto de tiempo: Netlify corta a los 10s. Se deja ~1s de margen
