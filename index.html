@@ -1647,9 +1647,19 @@ async function onGenerateClick(){
     // en paralelo imágenes relacionadas con el tema en múltiples bancos de
     // imágenes/arte, se puntúan por relación con el tema + resolución +
     // calidad visual, y se elige la mejor. Ver selectBestImageForItem().
-    const result = await selectBestImageForItem(item);
-    item.image = result.url;
-    item.imageIsFallback = result.isFallback;
+    // selectBestImageForItem() ya nunca lanza (siempre devuelve al menos el
+    // respaldo por categoría), pero este try/catch es una segunda red de
+    // seguridad: bajo NINGUNA circunstancia debe perderse una publicación
+    // completa por un fallo al buscar imagen.
+    try{
+      const result = await selectBestImageForItem(item);
+      item.image = result.url;
+      item.imageIsFallback = result.isFallback;
+    }catch(e){
+      log(`Búsqueda de imagen falló para "${item.title}" (${e.message || e}). Usando imagen de respaldo.`, "warn");
+      item.image = FALLBACK_IMAGE_BY_CAT[item.category] || FALLBACK_IMAGE_BY_CAT["anime"];
+      item.imageIsFallback = true;
+    }
 
     // Escalonado por ítem para no saturar el límite de peticiones por
     // minuto de la cuota gratuita de Gemini (free tier). Como ahora hay
@@ -2457,9 +2467,33 @@ async function searchWikimediaCommons(query, limit = 5){
 // proxy CORS ya usado por el proyecto para RSS, extrayendo las imágenes
 // disponibles en su HTML público. Si el proxy o el parseo fallan, la fuente
 // simplemente no aporta candidatos (no interrumpe el resto de la búsqueda).
+//
+// A diferencia de fetchWithCorsProxy (usado por el RSS, que sí prueba los
+// dos proxies en serie con 12s cada uno), aquí se usa UN SOLO proxy con un
+// timeout corto (6s) y SIN reintento con el segundo proxy. Motivo: estas
+// son fuentes "extra" de un pool de 13, no la fuente principal del RSS, así
+// que no vale la pena esperar hasta 24s por una sola de ellas — es mejor
+// fallar rápido y dejar que las demás fuentes (o el fallback) cubran el
+// hueco. Esto también evita saturar el proxy compartido con el RSS.
+async function fetchWithCorsProxyFast(targetUrl, timeoutMs = 6000){
+  const proxy = CORS_PROXIES[0];
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try{
+    const res = await fetch(proxy + encodeURIComponent(targetUrl), {
+      cache: "no-store",
+      signal: controller.signal
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return await res.text();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function searchViaProxyHtml(pageUrl, sourceLabel, imgRegex, limit = 6){
   try{
-    const html = await fetchWithCorsProxy(pageUrl);
+    const html = await fetchWithCorsProxyFast(pageUrl);
     const found = [];
     let m;
     const re = new RegExp(imgRegex, "gi");
@@ -2511,82 +2545,123 @@ function searchPixiv(query, limit = 6){
   return searchViaProxyHtml(url, "Pixiv", 'data-src="([^"]+)"', limit);
 }
 
+// Envuelve cualquier promesa de búsqueda con un timeout propio: si esa
+// fuente concreta no responde a tiempo, se resuelve a lista vacía en vez de
+// dejar colgado al Promise.allSettled general. Cada fuente es independiente
+// de las demás, así una lenta nunca retrasa a todo el pool.
+function withTimeout(promise, ms){
+  return Promise.race([
+    promise,
+    new Promise(resolve => setTimeout(() => resolve([]), ms))
+  ]);
+}
+
+// Tiempo máximo total que se le da a la búsqueda de imagen de UNA
+// publicación antes de resignarse a usar lo que ya se tenga (o el
+// fallback). Protege la generación completa de quedar bloqueada si los
+// proxies CORS compartidos están saturados o caídos.
+const IMAGE_SEARCH_HARD_TIMEOUT_MS = 9000;
+
 // Punto único de orquestación: arma el pool de candidatas consultando TODAS
 // las fuentes en paralelo (RSS incluido, sin prioridad), filtra, puntúa y
 // elige la mejor. Devuelve { url, isFallback, sourceLabel }.
+// Nunca lanza: cualquier fallo, individual o total, cae al respaldo por
+// categoría para garantizar que la publicación SIEMPRE tenga imagen.
 async function selectBestImageForItem(item){
-  const query = buildImageSearchQuery(item.title);
-  const queryWords = query.split(/\s+/).filter(Boolean);
-  const intent = detectImageIntent(item);
+  try{
+    const query = buildImageSearchQuery(item.title);
+    const queryWords = query.split(/\s+/).filter(Boolean);
+    const intent = detectImageIntent(item);
 
-  const candidates = [];
+    const candidates = [];
 
-  // La imagen que ya trae el RSS (si la trae) entra como una candidata más,
-  // marcada como "oficial/del artículo" para la regla especial de
-  // visuales/pósters/tráilers, pero SIN saltarse el resto de la búsqueda.
-  if (item.image){
-    candidates.push({
-      url: item.image,
-      width: 0,
-      height: 0,
-      matchText: item.title,
-      qualityHint: 0.65,
-      isOriginalRss: true,
-      sourceLabel: item.source || "Fuente original"
+    // La imagen que ya trae el RSS (si la trae) entra como una candidata más,
+    // marcada como "oficial/del artículo" para la regla especial de
+    // visuales/pósters/tráilers, pero SIN saltarse el resto de la búsqueda.
+    if (item.image){
+      candidates.push({
+        url: item.image,
+        width: 0,
+        height: 0,
+        matchText: item.title,
+        qualityHint: 0.65,
+        isOriginalRss: true,
+        sourceLabel: item.source || "Fuente original"
+      });
+    }
+
+    // Fuentes directas (API JSON pública, sin proxy): timeout individual
+    // generoso (7s) porque suelen responder rápido y son las más fiables.
+    // Fuentes vía proxy HTML: timeout más corto (6s, ya aplicado dentro de
+    // fetchWithCorsProxyFast) más este margen extra de red/parseo.
+    const searches = [
+      withTimeout(findFallbackImageForTitle(item.title).then(url => url ? [{
+        url, width: 0, height: 0, matchText: item.title, qualityHint: 0.8,
+        isOriginalRss: true, sourceLabel: "MAL/AniList (oficial)"
+      }] : []).catch(() => []), 7000),
+      withTimeout(searchDanbooruLike("https://danbooru.donmai.us/posts.json", query, "Danbooru"), 7000),
+      withTimeout(searchDanbooruLike("https://safebooru.donmai.us/posts.json", query, "Safebooru"), 7000),
+      withTimeout(searchDanbooruLike("https://konachan.com/post.json", query, "Konachan"), 7000),
+      withTimeout(searchWallhaven(query), 7000),
+      withTimeout(searchWikimediaCommons(query), 7000),
+      withTimeout(searchZerochan(query), 7000),
+      withTimeout(searchAnimePictures(query), 7000),
+      withTimeout(searchPinterest(query), 7000),
+      withTimeout(searchDeviantArt(query), 7000),
+      withTimeout(searchArtStation(query), 7000),
+      withTimeout(searchBingImages(query), 7000),
+      withTimeout(searchPixiv(query), 7000)
+    ];
+
+    // Límite duro sobre el conjunto: si por lo que sea las promesas
+    // individuales no respetaran su timeout, esto igual libera la
+    // publicación a los IMAGE_SEARCH_HARD_TIMEOUT_MS con lo que haya
+    // llegado hasta ese momento.
+    const settled = await withTimeout(Promise.allSettled(searches), IMAGE_SEARCH_HARD_TIMEOUT_MS);
+    if (Array.isArray(settled)){
+      settled.forEach(r => {
+        if (r && r.status === "fulfilled" && Array.isArray(r.value)) candidates.push(...r.value);
+      });
+    }
+
+    let pool = candidates.filter(passesMandatoryFilters);
+    log(`Imagen "${item.title.slice(0,40)}…": ${candidates.length} candidatas encontradas, ${pool.length} pasan filtros.`, pool.length ? "ok" : "warn");
+
+    // Regla especial: contenido de visual/póster/tráiler/teaser oficial →
+    // se prioriza fuertemente la imagen oficial (RSS/MAL/AniList) sobre arte
+    // de fans/wallpapers, sin descartar por completo el resto del pool.
+    if (intent === "official"){
+      const officialPool = pool.filter(c => c.isOriginalRss);
+      if (officialPool.length) pool = officialPool;
+    }
+    // Para curiosidad/debate/comparación/ranking/polémica no se restringe nada:
+    // cualquier imagen bien relacionada (fanart, wallpaper, ilustración) vale.
+
+    if (pool.length === 0){
+      const fallbackUrl = FALLBACK_IMAGE_BY_CAT[item.category] || FALLBACK_IMAGE_BY_CAT["anime"];
+      log(`Imagen "${item.title.slice(0,40)}…": ninguna candidata pasó los filtros, usando respaldo por categoría.`, "warn");
+      return { url: fallbackUrl, isFallback: true, sourceLabel: "Respaldo genérico" };
+    }
+
+    let best = pool[0];
+    let bestScore = -1;
+    pool.forEach(c => {
+      const s = scoreImageCandidate(c, queryWords);
+      if (s > bestScore){ bestScore = s; best = c; }
     });
-  }
+    log(`Imagen "${item.title.slice(0,40)}…": elegida de ${best.sourceLabel} (score ${bestScore.toFixed(2)}).`, "ok");
 
-  const searches = [
-    findFallbackImageForTitle(item.title).then(url => url ? [{
-      url, width: 0, height: 0, matchText: item.title, qualityHint: 0.8,
-      isOriginalRss: true, sourceLabel: "MAL/AniList (oficial)"
-    }] : []),
-    searchDanbooruLike("https://danbooru.donmai.us/posts.json", query, "Danbooru"),
-    searchDanbooruLike("https://safebooru.donmai.us/posts.json", query, "Safebooru"),
-    searchDanbooruLike("https://konachan.com/post.json", query, "Konachan"),
-    searchWallhaven(query),
-    searchWikimediaCommons(query),
-    searchZerochan(query),
-    searchAnimePictures(query),
-    searchPinterest(query),
-    searchDeviantArt(query),
-    searchArtStation(query),
-    searchBingImages(query),
-    searchPixiv(query)
-  ];
-
-  const settled = await Promise.allSettled(searches);
-  settled.forEach(r => { if (r.status === "fulfilled") candidates.push(...r.value); });
-
-  let pool = candidates.filter(passesMandatoryFilters);
-
-  // Regla especial: contenido de visual/póster/tráiler/teaser oficial →
-  // se prioriza fuertemente la imagen oficial (RSS/MAL/AniList) sobre arte
-  // de fans/wallpapers, sin descartar por completo el resto del pool.
-  if (intent === "official"){
-    const officialPool = pool.filter(c => c.isOriginalRss);
-    if (officialPool.length) pool = officialPool;
-  }
-  // Para curiosidad/debate/comparación/ranking/polémica no se restringe nada:
-  // cualquier imagen bien relacionada (fanart, wallpaper, ilustración) vale.
-
-  if (pool.length === 0){
+    return {
+      url: upgradeImageUrl(best.url) || (FALLBACK_IMAGE_BY_CAT[item.category] || FALLBACK_IMAGE_BY_CAT["anime"]),
+      isFallback: false,
+      sourceLabel: best.sourceLabel || "Búsqueda multifuente"
+    };
+  }catch(e){
+    // Red de seguridad final: pase lo que pase, la publicación siempre
+    // recibe al menos la imagen de respaldo por categoría.
     const fallbackUrl = FALLBACK_IMAGE_BY_CAT[item.category] || FALLBACK_IMAGE_BY_CAT["anime"];
-    return { url: fallbackUrl, isFallback: true, sourceLabel: "Respaldo genérico" };
+    return { url: fallbackUrl, isFallback: true, sourceLabel: "Respaldo genérico (error)" };
   }
-
-  let best = pool[0];
-  let bestScore = -1;
-  pool.forEach(c => {
-    const s = scoreImageCandidate(c, queryWords);
-    if (s > bestScore){ bestScore = s; best = c; }
-  });
-
-  return {
-    url: upgradeImageUrl(best.url),
-    isFallback: false,
-    sourceLabel: best.sourceLabel || "Búsqueda multifuente"
-  };
 }
 
 // Cuando un ítem (normalmente de RSS) no trae imagen, intenta encontrar una imagen
