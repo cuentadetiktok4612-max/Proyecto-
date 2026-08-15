@@ -1655,10 +1655,12 @@ async function onGenerateClick(){
       const result = await selectBestImageForItem(item);
       item.image = result.url;
       item.imageIsFallback = result.isFallback;
+      item.imageIsAiGenerated = !!result.isAiGenerated;
     }catch(e){
       log(`Búsqueda de imagen falló para "${item.title}" (${e.message || e}). Usando imagen de respaldo.`, "warn");
       item.image = FALLBACK_IMAGE_BY_CAT[item.category] || FALLBACK_IMAGE_BY_CAT["anime"];
       item.imageIsFallback = true;
+      item.imageIsAiGenerated = false;
     }
 
     // Escalonado por ítem para no saturar el límite de peticiones por
@@ -2688,8 +2690,14 @@ async function selectBestImageForItem(item){
     // cualquier imagen bien relacionada (fanart, wallpaper, ilustración) vale.
 
     if (pool.length === 0){
+      log(`Imagen "${item.title.slice(0,40)}…": ninguna candidata pasó los filtros, generando con IA (Pollinations)…`, "warn");
+      const aiUrl = await generateImageWithPollinations(item);
+      if (aiUrl){
+        log(`Imagen "${item.title.slice(0,40)}…": generada con IA.`, "ok");
+        return { url: aiUrl, isFallback: false, isAiGenerated: true, sourceLabel: "Generada con IA" };
+      }
       const fallbackUrl = FALLBACK_IMAGE_BY_CAT[item.category] || FALLBACK_IMAGE_BY_CAT["anime"];
-      log(`Imagen "${item.title.slice(0,40)}…": ninguna candidata pasó los filtros, usando respaldo por categoría.`, "warn");
+      log(`Imagen "${item.title.slice(0,40)}…": la generación con IA también falló, usando respaldo por categoría.`, "warn");
       return { url: fallbackUrl, isFallback: true, sourceLabel: "Respaldo genérico" };
     }
 
@@ -2722,8 +2730,14 @@ async function selectBestImageForItem(item){
     }
 
     if (!verifiedCandidate){
+      log(`Imagen "${item.title.slice(0,40)}…": ninguna candidata superó la verificación real de resolución, generando con IA (Pollinations)…`, "warn");
+      const aiUrl = await generateImageWithPollinations(item);
+      if (aiUrl){
+        log(`Imagen "${item.title.slice(0,40)}…": generada con IA.`, "ok");
+        return { url: aiUrl, isFallback: false, isAiGenerated: true, sourceLabel: "Generada con IA" };
+      }
       const fallbackUrl = FALLBACK_IMAGE_BY_CAT[item.category] || FALLBACK_IMAGE_BY_CAT["anime"];
-      log(`Imagen "${item.title.slice(0,40)}…": ninguna candidata superó la verificación real de resolución, usando respaldo por categoría.`, "warn");
+      log(`Imagen "${item.title.slice(0,40)}…": la generación con IA también falló, usando respaldo por categoría.`, "warn");
       return { url: fallbackUrl, isFallback: true, sourceLabel: "Respaldo genérico" };
     }
 
@@ -2813,6 +2827,53 @@ const ICON_BY_CAT = {
 // así siempre cae una imagen temática consistente y sin depender de terceros con key).
 // Se usan SOLO cuando la fuente original no trae ninguna imagen y no se encontró
 // una imagen relacionada al título vía AniList/Jikan (ver findFallbackImageForTitle).
+// Estilo visual por categoría para el prompt de generación por IA. Se
+// reusa la misma idea de CATEGORY_STYLE que existía en el backend de
+// Cloudflare (ya eliminado): mapear la categoría de la publicación a un
+// lenguaje de estilo que el modelo de imagen entienda bien.
+const AI_IMAGE_CATEGORY_STYLE = {
+  anime: "vibrant modern anime style, cinematic lighting",
+  manga: "manga art style, dynamic black and white illustration with color accents",
+  manhwa: "korean manhwa style, clean lines, soft modern color palette",
+  videojuegos: "video game concept art style, dramatic lighting, game cover composition",
+  colaboraciones: "vibrant modern anime style, dynamic composition",
+  polemicas: "vibrant modern anime style, dramatic mood lighting",
+  adaptaciones: "vibrant modern anime style, cinematic lighting",
+  "live-action": "cinematic movie poster style, dramatic lighting",
+  curiosidades: "otaku pop art style, bold vivid colors",
+  estrenos: "vibrant modern anime style, cinematic lighting, premiere poster feel"
+};
+
+// Genera una imagen con IA vía Pollinations (sin API key, sin costo) cuando
+// la búsqueda multifuente no encontró ninguna imagen real de buena calidad
+// para la publicación. Se arma un prompt a partir del título y la
+// categoría, nunca pidiendo personajes con nombre propio o IP específica,
+// para mantenerse en arte genérico relacionado al tema.
+// Devuelve la URL de la imagen generada, o null si falla/tarda demasiado
+// (el llamador debe caer al respaldo genérico en ese caso).
+async function generateImageWithPollinations(item){
+  try{
+    const style = AI_IMAGE_CATEGORY_STYLE[item.category] || AI_IMAGE_CATEGORY_STYLE.anime;
+    const topic = (item.title || "").slice(0, 120);
+    const prompt = `original illustration inspired by the theme: ${topic}, ${style}, no text, no watermark, no logos, not based on any specific existing franchise or character, vertical portrait composition, professional social media cover quality`;
+    const seed = Math.floor(Math.random() * 1e9);
+    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=864&height=1080&seed=${seed}&nologo=true`;
+
+    // Pollinations genera "al vuelo": la URL solo resuelve cuando la imagen
+    // termina de generarse. Se confirma con una descarga real (con timeout)
+    // en vez de solo construir la URL, porque una URL que nunca carga
+    // dejaría la publicación con una imagen rota en vez de caer al respaldo.
+    const ok = await withTimeout(
+      fetch(url).then(res => res.ok && (res.headers.get("content-type") || "").startsWith("image/")),
+      25000
+    ).catch(() => false);
+
+    return ok ? url : null;
+  }catch(e){
+    return null;
+  }
+}
+
 const FALLBACK_IMAGE_BY_CAT = {
   "anime":            "https://picsum.photos/seed/otagen-anime/800/450",
   "manga":             "https://picsum.photos/seed/otagen-manga/800/450",
@@ -2992,6 +3053,7 @@ async function buildPostWithAI(item){
     image: item.image,
     originalImage: item.image,
     imageIsFallback: !!item.imageIsFallback,
+    imageIsAiGenerated: !!item.imageIsAiGenerated,
     link: item.link,
     source: item.source,
     sourceIcon: item.sourceIcon || "newspaper",
@@ -3111,6 +3173,7 @@ function buildPostTemplate(item){
     image: item.image,
     originalImage: item.image,
     imageIsFallback: !!item.imageIsFallback,
+    imageIsAiGenerated: !!item.imageIsAiGenerated,
     link: item.link,
     source: item.source,
     sourceIcon: item.sourceIcon || "newspaper",
@@ -3183,6 +3246,7 @@ function cardHtml(p){
         <span class="card-cat" style="color:${cat.color}">${svgIcon(catIcon)}${cat.label}</span>
         <span class="card-type">${svgIcon(type.icon)}${type.label}</span>
         ${p.imageIsFallback ? `<span class="card-fallback-flag">${svgIcon("layers")}Imagen de respaldo</span>` : ""}
+        ${p.imageIsAiGenerated ? `<span class="card-fallback-flag">${svgIcon("sparkles")}Generada con IA</span>` : ""}
         ${p.imageIsCustom ? `<span class="card-fallback-flag">${svgIcon("image")}Imagen propia</span>` : ""}
         ${p.imageIsLocalEdit ? `<span class="card-fallback-flag">${svgIcon("sparkles")}Mejorada</span>` : ""}
       </div>
