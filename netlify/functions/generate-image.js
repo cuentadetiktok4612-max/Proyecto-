@@ -1,44 +1,54 @@
 // netlify/functions/generate-image.js
 //
-// Edita/mejora la imagen OFICIAL real de la publicación (portada de MAL,
-// cover de IGDB, imagen del RSS, etc.) usando Gemini 2.5 Flash Image
-// ("Nano Banana") en modo edición de imagen — no genera desde cero. Si no
-// hay imagen oficial disponible, cae a generación desde texto como
-// respaldo. Devuelve la imagen resultante como base64 (data URL).
+// Genera o edita la imagen de portada de una publicación usando Cloudflare
+// Workers AI (gratis, 10,000 Neurons/día, sin tarjeta de crédito):
+//   - Si hay imagen OFICIAL real disponible (portada de MAL, cover de IGDB,
+//     imagen del RSS) -> se EDITA/mejora con @cf/runwayml/stable-diffusion-
+//     v1-5-img2img, conservando el contenido original, solo mejorando
+//     nitidez/composición.
+//   - Si no hay imagen oficial -> se GENERA desde cero con
+//     @cf/black-forest-labs/flux-1-schnell, sin pedir nunca personajes con
+//     nombre propio o IP reconocible.
 //
-// POR QUÉ EDITAR EN VEZ DE GENERAR DESDE CERO: partir de la imagen oficial
-// real y pedir una mejora/adaptación de composición es un caso de uso muy
-// distinto (para el filtro de seguridad de Google) que pedir "dibuja a
-// [personaje]" desde un prompt de texto vacío. Editar una imagen que el
-// usuario ya tiene derecho a usar (portada pública de un catálogo como MAL/
-// IGDB) tiene mucha menor probabilidad de disparar el bloqueo de
-// copyright/seguridad que generar un personaje reconocible desde cero.
+// POR QUÉ CLOUDFLARE Y NO GEMINI: la API de Gemini dejó de tener cuota
+// gratuita real para sus modelos de imagen (gemini-2.5-flash-image) —
+// devuelve "limit: 0" incluso dentro de lo que la documentación describe
+// como tier gratuito. Cloudflare Workers AI sí tiene un tier gratuito
+// verificado y estable para generación/edición de imágenes.
 //
-// REGLA CENTRAL (se mantiene igual que antes): esto NO elimina el filtro de
-// seguridad de Google, solo reduce cuánto se dispara. Si Gemini aun así
-// bloquea la edición (o, en el caso de respaldo sin imagen oficial, la
-// generación desde texto) por seguridad/copyright, esta función lo detecta
-// explícitamente (via finishReason o promptFeedback.blockReason) y responde
-// con blocked:true — nunca intenta reformular para evadir el filtro. El
-// frontend debe usar esa señal, y solo esa, para conservar la imagen
-// original sin editar.
+// NOTA SOBRE COPYRIGHT: a diferencia de Gemini, los modelos de Stable
+// Diffusion/FLUX en Cloudflare no traen un filtro de seguridad explícito
+// que reporte "bloqueado por copyright" en la respuesta (no hay un
+// finishReason ni blockReason equivalente). Por eso esta función YA NO
+// puede detectar bloqueos de copyright de forma confiable — simplemente
+// nunca se le pide reproducir un personaje con nombre propio en el prompt
+// de generación desde cero, y en edición se le pide conservar el contenido
+// original tal cual (mejorar, no reinterpretar), lo cual reduce el riesgo
+// por diseño del prompt en vez de por un filtro de la plataforma. El campo
+// "blocked" se mantiene en la respuesta por compatibilidad con el frontend,
+// pero siempre será false con este proveedor.
 //
-// Variable de entorno requerida en Netlify: GEMINI_API_KEY (la misma que
-// ya usa generate-post-gemini.js).
+// Variables de entorno requeridas en Netlify:
+//   CLOUDFLARE_ACCOUNT_ID
+//   CLOUDFLARE_API_TOKEN (con permiso "Workers AI - Read/Edit")
+// Se consiguen gratis en https://dash.cloudflare.com (cuenta gratis) ->
+// "Workers & Pages" -> "AI" para el Account ID, y "My Profile" -> "API
+// Tokens" -> "Create Token" -> plantilla "Workers AI" para el token.
 
-const GEMINI_IMAGE_MODEL = "gemini-2.5-flash-image";
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_IMAGE_MODEL}:generateContent`;
+const CF_BASE = "https://api.cloudflare.com/client/v4/accounts";
+const MODEL_GENERATE = "@cf/black-forest-labs/flux-1-schnell";
+const MODEL_EDIT = "@cf/runwayml/stable-diffusion-v1-5-img2img";
 
 // Presupuesto de tiempo: Netlify corta a los 10s (plan gratuito). Descargar
-// la imagen fuente + llamar a Gemini comparten este presupuesto, por eso el
-// límite de descarga es más corto (2.5s) para dejarle margen a Gemini.
+// la imagen fuente + llamar a Cloudflare comparten este presupuesto.
 const TIMEOUT_MS = 9000;
 const IMAGE_FETCH_TIMEOUT_MS = 2500;
 
 exports.handler = async (event) => {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    return jsonResponse({ error: "GEMINI_API_KEY no configurada." }, 500);
+  const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+  const apiToken = process.env.CLOUDFLARE_API_TOKEN;
+  if (!accountId || !apiToken) {
+    return jsonResponse({ error: "Falta configurar CLOUDFLARE_ACCOUNT_ID o CLOUDFLARE_API_TOKEN en Netlify." }, 500);
   }
 
   if (event.httpMethod !== "POST") {
@@ -61,89 +71,66 @@ exports.handler = async (event) => {
   const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
   try {
-    // Intenta descargar la imagen oficial real para usarla como base de
-    // edición. Si no hay URL, o la descarga falla por cualquier motivo
-    // (404, CORS del lado servidor, timeout corto), se sigue sin imagen
-    // fuente — no es un error fatal, cae al modo de generación desde texto.
-    let sourceImage = null;
+    let sourceImageB64 = null;
     if (sourceImageUrl && typeof sourceImageUrl === "string") {
-      sourceImage = await tryFetchImageAsBase64(sourceImageUrl).catch(() => null);
+      sourceImageB64 = await tryFetchImageAsBase64(sourceImageUrl).catch(() => null);
     }
 
-    const prompt = sourceImage
+    const usedSourceImage = !!sourceImageB64;
+    const model = usedSourceImage ? MODEL_EDIT : MODEL_GENERATE;
+    const prompt = usedSourceImage
       ? buildEditPrompt({ title, category, postType, summary })
       : buildGeneratePrompt({ title, category, postType, summary });
 
-    const parts = [];
-    if (sourceImage) {
-      parts.push({ inline_data: { mime_type: sourceImage.mimeType, data: sourceImage.base64 } });
+    const payload = { prompt };
+    if (usedSourceImage) {
+      payload.image_b64 = sourceImageB64;
+      payload.strength = 0.55;
+      payload.num_steps = 20;
+    } else {
+      payload.width = 864;
+      payload.height = 1080;
     }
-    parts.push({ text: prompt });
 
-    const payload = {
-      contents: [{ role: "user", parts }],
-      generationConfig: {
-        responseModalities: ["IMAGE"]
-      }
-    };
-
-    const res = await fetch(GEMINI_URL, {
+    const url = `${CF_BASE}/${accountId}/ai/run/${model}`;
+    const res = await fetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-goog-api-key": apiKey
+        "Authorization": `Bearer ${apiToken}`
       },
       body: JSON.stringify(payload),
       signal: controller.signal
     });
-    const json = await res.json().catch(() => ({}));
+
+    const contentType = res.headers.get("content-type") || "";
 
     if (!res.ok) {
-      const message = json?.error?.message || `HTTP ${res.status}`;
-      // 429 = cuota agotada (500/día en el free tier) — no es bloqueo de
-      // copyright, el frontend debe tratarlo como "IA no disponible ahora",
-      // no como señal de conservar la imagen original por copyright.
-      return jsonResponse({ error: message, blocked: false, usedSourceImage: !!sourceImage }, res.status);
+      const errJson = await res.json().catch(() => ({}));
+      const message = errJson?.errors?.[0]?.message || `HTTP ${res.status}`;
+      return jsonResponse({ error: message, blocked: false, usedSourceImage }, res.status);
     }
 
-    const candidate = json?.candidates?.[0];
-
-    // Señal de bloqueo por seguridad/copyright: Gemini reporta esto en
-    // promptFeedback.blockReason (bloqueo del prompt/imagen de entrada) o en
-    // finishReason del candidato (bloqueo de la salida ya generada).
-    // IMAGE_SAFETY / PROHIBITED_CONTENT / RECITATION son las razones típicas
-    // cuando el filtro detecta un personaje o material protegido.
-    const promptBlockReason = json?.promptFeedback?.blockReason;
-    const finishReason = candidate?.finishReason;
-    const isBlockedByCopyrightOrSafety = !!promptBlockReason
-      || ["IMAGE_SAFETY", "PROHIBITED_CONTENT", "RECITATION", "SAFETY"].includes(finishReason);
-
-    if (isBlockedByCopyrightOrSafety) {
+    if (contentType.startsWith("image/")) {
+      const buffer = await res.arrayBuffer();
+      const base64 = Buffer.from(buffer).toString("base64");
       return jsonResponse({
-        blocked: true,
-        reason: promptBlockReason || finishReason,
-        usedSourceImage: !!sourceImage
+        blocked: false,
+        dataUrl: `data:${contentType};base64,${base64}`,
+        usedSourceImage
       }, 200);
     }
 
-    const imagePart = candidate?.content?.parts?.find(p => p.inlineData || p.inline_data);
-    const inline = imagePart && (imagePart.inlineData || imagePart.inline_data);
-
-    if (!inline || !inline.data) {
-      // No vino imagen y tampoco hubo señal explícita de bloqueo: se trata
-      // como error genérico (no como bloqueo de copyright), para que el
-      // frontend no caiga a "conservar imagen original" por una causa
-      // distinta a la pensada (ej. timeout parcial, modelo sin devolver
-      // contenido).
-      return jsonResponse({ error: `Gemini no devolvió imagen (finishReason: ${finishReason || "desconocida"}).`, blocked: false, usedSourceImage: !!sourceImage }, 502);
+    const json = await res.json().catch(() => null);
+    if (json && json.result && json.result.image) {
+      return jsonResponse({
+        blocked: false,
+        dataUrl: `data:image/png;base64,${json.result.image}`,
+        usedSourceImage
+      }, 200);
     }
 
-    const mimeType = inline.mimeType || inline.mime_type || "image/png";
-    return jsonResponse({
-      blocked: false,
-      dataUrl: `data:${mimeType};base64,${inline.data}`,
-      usedSourceImage: !!sourceImage
-    }, 200);
+    return jsonResponse({ error: "Cloudflare no devolvió una imagen reconocible.", blocked: false, usedSourceImage }, 502);
   } catch (e) {
     const message = e.name === "AbortError" ? "Tiempo de espera agotado generando la imagen." : (e.message || String(e));
     return jsonResponse({ error: message, blocked: false }, 500);
@@ -152,10 +139,6 @@ exports.handler = async (event) => {
   }
 };
 
-// Descarga una imagen desde su URL real y la devuelve como base64 + mime
-// type, listos para enviar a Gemini como imagen de entrada. Se limita el
-// tamaño a 8MB (límite razonable de la API) y se usa un timeout corto para
-// no comerse el presupuesto de tiempo completo de la función.
 async function tryFetchImageAsBase64(url) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), IMAGE_FETCH_TIMEOUT_MS);
@@ -166,8 +149,7 @@ async function tryFetchImageAsBase64(url) {
     if (!contentType.startsWith("image/")) throw new Error("La URL fuente no es una imagen");
     const buffer = await res.arrayBuffer();
     if (buffer.byteLength > 8 * 1024 * 1024) throw new Error("Imagen fuente demasiado grande");
-    const base64 = Buffer.from(buffer).toString("base64");
-    return { base64, mimeType: contentType.split(";")[0].trim() };
+    return Buffer.from(buffer).toString("base64");
   } finally {
     clearTimeout(timeout);
   }
@@ -181,38 +163,14 @@ const CATEGORY_STYLE = {
   curiosidades: "ilustración temática otaku, estilo pop art anime, colores llamativos"
 };
 
-// Prompt de EDICIÓN: parte de la imagen oficial real (ya provista como
-// primera parte del contenido) y pide mejorarla/adaptarla — nunca
-// reemplazar el contenido reconocible por otro personaje ni "reinventar"
-// la escena, solo mejorar calidad y adaptar composición al formato de
-// tarjeta. Mismas condiciones de "sin texto/logos" que el modo generación.
-function buildEditPrompt({ title, category, postType, summary }) {
+function buildEditPrompt({ category }) {
   const style = CATEGORY_STYLE[category] || CATEGORY_STYLE.anime;
-
-  return `Esta es la imagen OFICIAL real asociada a esta noticia/publicación: "${title}". ${summary ? `Contexto: ${summary.slice(0, 300)}` : ""}
-
-Tarea: edita y mejora esta imagen para usarla como portada de una publicación de red social, SIN cambiar lo que la imagen representa. Instrucciones:
-- Mejora nitidez, calidad y definición general de la imagen.
-- Ajusta la composición y el encuadre para que funcione bien en formato vertical (proporción 4:5, retrato), dejando espacio negativo limpio en la parte superior o inferior para poder superponer texto después.
-- Puedes mejorar iluminación, contraste y color de forma sutil, en línea con este estilo: ${style}.
-- Conserva el contenido, los personajes y la composición original reconocibles — esto es una MEJORA de la imagen existente, no una reinterpretación ni un reemplazo.
-- No agregues texto, letras, palabras, logos ni marcas de agua dentro de la imagen.
-- No agregues personajes ni elementos que no estaban en la imagen original.`;
+  return `high quality, sharp, detailed, ${style}, professional social media cover art, clean composition, vertical portrait format`;
 }
 
-// Prompt de GENERACIÓN DESDE CERO: se usa solo cuando no hay imagen oficial
-// disponible (no vino sourceImageUrl, o falló la descarga). Igual que
-// antes: nunca pide un personaje con nombre propio o IP reconocible.
-function buildGeneratePrompt({ title, category, postType, summary }) {
+function buildGeneratePrompt({ category }) {
   const style = CATEGORY_STYLE[category] || CATEGORY_STYLE.anime;
-
-  return `Genera UNA sola ilustración original, vertical (formato retrato, proporción 4:5), para la portada de una publicación de red social sobre cultura otaku/gaming.
-
-Tema/contexto de la noticia (úsalo solo como inspiración de AMBIENTE y EMOCIÓN, NO reproduzcas personajes, logos ni obras con derechos de autor reconocibles): "${title}". ${summary ? `Contexto adicional: ${summary.slice(0, 300)}` : ""}
-
-Estilo requerido: ${style}. Composición limpia con espacio negativo en la parte superior e inferior para poder superponer texto después (título arriba o abajo, según convenga). Sin texto, letras, palabras ni logos dentro de la imagen misma. Sin marcas de agua.
-
-IMPORTANTE: la escena y los personajes deben ser ORIGINALES, inspirados en el género/tono/emoción del tema, nunca una réplica de un personaje, franquicia o marca específica existente.`;
+  return `original anime/manga illustration, ${style}, dynamic composition, vertical portrait format, no text, no watermark, no logos, original characters only, not based on any specific existing franchise or character`;
 }
 
 function jsonResponse(body, statusCode = 200) {
