@@ -1642,11 +1642,14 @@ async function onGenerateClick(){
   const newPosts = [];
 
   await Promise.all(chosen.map(async (item, idx) => {
-    if (!item.image){
-      const found = await findFallbackImageForTitle(item.title);
-      item.image = found || FALLBACK_IMAGE_BY_CAT[item.category] || FALLBACK_IMAGE_BY_CAT["anime"];
-      item.imageIsFallback = true;
-    }
+    // Búsqueda de imagen MULTIFUENTE: la imagen del RSS (si la trae el item)
+    // es solo una candidata más, nunca tiene prioridad automática. Se buscan
+    // en paralelo imágenes relacionadas con el tema en múltiples bancos de
+    // imágenes/arte, se puntúan por relación con el tema + resolución +
+    // calidad visual, y se elige la mejor. Ver selectBestImageForItem().
+    const result = await selectBestImageForItem(item);
+    item.image = result.url;
+    item.imageIsFallback = result.isFallback;
 
     // Escalonado por ítem para no saturar el límite de peticiones por
     // minuto de la cuota gratuita de Gemini (free tier). Como ahora hay
@@ -2244,6 +2247,346 @@ function textOf(node, tag){
 function attrLink(node){
   const el = node.querySelector("link");
   return el ? (el.getAttribute("href") || "") : "";
+}
+
+/* =========================================================
+   BÚSQUEDA DE IMÁGENES MULTIFUENTE
+   =========================================================
+   La imagen que trae el RSS (extractReliableImage) deja de tener
+   prioridad automática: es UNA candidata más dentro de un pool que se
+   arma consultando en paralelo varios bancos de imágenes/arte, y luego
+   se puntúa y se elige la mejor por relación con el tema + resolución +
+   calidad visual (ver SCORE_WEIGHTS más abajo).
+
+   Fuentes activas (todas con API pública JSON y CORS abierto, sin key,
+   accesibles directamente desde el navegador):
+     - Danbooru, Safebooru, Konachan, Wallhaven (bancos de arte/ilustración
+       y fondos de pantalla con API pública)
+     - Wikimedia Commons (API REST pública; útil para imágenes oficiales,
+       carteles, fotografías de eventos, capturas de dominio público)
+     - Jikan (MAL) / AniList (portadas oficiales de anime/manga)
+
+   Fuentes SIN API pública / que exigen auth o bloquean CORS desde el
+   navegador (Pinterest, Pixiv, Zerochan, Anime-Pictures, DeviantArt,
+   ArtStation, Bing Images): en este entorno (cliente puro, sin backend
+   propio de scraping) se consultan a través del mismo proxy CORS que ya
+   usa el proyecto para RSS (CORS_PROXIES / fetchWithCorsProxy), extrayendo
+   imágenes de sus páginas públicas de resultados. Si un proxy falla o la
+   fuente cambia su HTML, esa fuente simplemente no aporta candidatos ese
+   ciclo (no rompe la generación: el resto de fuentes cubre el hueco).
+   ========================================================= */
+
+// Pesos de la fórmula de selección: relación con el tema 50%, resolución
+// 30%, calidad visual 20% (ver scoreImageCandidate()).
+const IMAGE_SCORE_WEIGHTS = { relevance: 0.5, resolution: 0.3, quality: 0.2 };
+
+// Palabras clave que, si aparecen en el título, indican que la publicación
+// trata sobre material promocional oficial (visual, póster, tráiler,
+// teaser...). En ese caso se prioriza la imagen oficial (RSS/Jikan/AniList)
+// muy por encima de arte de fans/wallpapers.
+const OFFICIAL_ART_KEYWORDS = [
+  "visual", "póster", "poster", "key visual", "tráiler", "trailer", "teaser",
+  "adelanto", "primer vistazo", "primera imagen", "imagen promocional",
+  "arte promocional", "portada oficial", "cover oficial", "pv", "promo",
+  "afiche", "cartel"
+];
+
+// Palabras clave que indican contenido de opinión/curiosidad donde CUALQUIER
+// imagen bien relacionada (fanart, wallpaper, ilustración) es válida.
+const OPEN_ART_KEYWORDS = [
+  "curiosidad", "curioso", "sabías que", "debate", "polémica", "polemica",
+  "comparación", "comparacion", "ranking", "top ", "mejores", "peor",
+  "vs.", " vs ", "encuesta", "opinión", "opinion"
+];
+
+function detectImageIntent(item){
+  const haystack = ((item.title || "") + " " + (item.summary || "")).toLowerCase();
+  const isOfficialPromo = OFFICIAL_ART_KEYWORDS.some(k => haystack.includes(k));
+  const isOpenTopic = (item.postType === "debate" || item.postType === "curiosidad")
+    || OPEN_ART_KEYWORDS.some(k => haystack.includes(k));
+  if (isOfficialPromo) return "official";
+  if (isOpenTopic) return "open";
+  return "neutral";
+}
+
+// Extrae del título las palabras clave relevantes para buscar en bancos de
+// imágenes de terceros (se descartan conectores y se limita la longitud
+// para no generar queries absurdamente largas).
+const IMAGE_SEARCH_STOPWORDS = new Set([
+  "de","la","el","los","las","un","una","unos","unas","y","o","en","con",
+  "para","por","su","sus","al","del","que","se","es","the","a","an","of",
+  "and","or","to","in","on","for","new","nuevo","nueva"
+]);
+function buildImageSearchQuery(title){
+  const words = (title || "")
+    .replace(/[«»"“”'’:,.!¿?()\[\]]/g, " ")
+    .split(/\s+/)
+    .filter(w => w.length > 2 && !IMAGE_SEARCH_STOPWORDS.has(w.toLowerCase()));
+  return words.slice(0, 6).join(" ").trim() || (title || "").slice(0, 40);
+}
+
+// Heurística de "calidad visual" a partir de metadatos disponibles (sin
+// descargar el binario completo, para no penalizar el tiempo de generación):
+// formato, señales de compresión agresiva en la URL/tags, y si la fuente es
+// conocida por curar contenido (booru con "score"/rating alto).
+function estimateQualityScore(candidate){
+  let score = 0.5;
+  const url = (candidate.url || "").toLowerCase();
+  if (/\.(png|webp)(\?|$)/.test(url)) score += 0.15;
+  if (/\.jpe?g(\?|$)/.test(url)) score += 0.05;
+  if (typeof candidate.qualityHint === "number") score = clamp01(candidate.qualityHint);
+  if (/thumb|small|preview|sample|150x150|300x169/.test(url)) score -= 0.35;
+  return clamp01(score);
+}
+
+function clamp01(n){ return Math.max(0, Math.min(1, n)); }
+
+// Puntúa una candidata (0..1) combinando relación con el tema, resolución
+// y calidad visual según IMAGE_SCORE_WEIGHTS. La relación con el tema se
+// basa en cuántas palabras clave del título coinciden con el texto
+// disponible de la candidata (título/tags de la fuente de origen).
+function scoreImageCandidate(candidate, queryWords){
+  const text = (candidate.matchText || "").toLowerCase();
+  let relevance = 0.3; // piso: toda candidata viene de una búsqueda por tema
+  if (queryWords.length && text){
+    const hits = queryWords.filter(w => text.includes(w.toLowerCase())).length;
+    relevance = clamp01(0.3 + (hits / queryWords.length) * 0.7);
+  }
+  if (candidate.isOriginalRss) relevance = clamp01(relevance + 0.1); // viene del propio artículo
+
+  const w = candidate.width || 0;
+  const h = candidate.height || 0;
+  let resolution;
+  if (!w || !h) resolution = 0.4; // sin metadatos de tamaño: ni se descarta ni se premia
+  else {
+    const maxSide = Math.max(w, h);
+    if (w < MIN_IMAGE_DIMENSION || h < MIN_IMAGE_DIMENSION * 0.5) resolution = 0;
+    else if (maxSide >= 2560) resolution = 1;
+    else if (maxSide >= 1920) resolution = 0.85;
+    else resolution = 0.55;
+  }
+
+  const quality = estimateQualityScore(candidate);
+
+  candidate._debugScores = { relevance, resolution, quality };
+  return relevance * IMAGE_SCORE_WEIGHTS.relevance
+       + resolution * IMAGE_SCORE_WEIGHTS.resolution
+       + quality * IMAGE_SCORE_WEIGHTS.quality;
+}
+
+// Filtros obligatorios: fuera miniaturas, imágenes borrosas/comprimidas y
+// resoluciones bajas. No se recorta ni se reescala nada; el filtro solo
+// decide si una URL entra o no al pool de candidatas.
+function passesMandatoryFilters(candidate){
+  const url = (candidate.url || "").toLowerCase();
+  if (!url) return false;
+  if (looksLikeIconOrTracker(url, { getAttribute: () => null })) return false;
+  if (/thumb|thumbnail|_s\.|_sm\.|150x150|100x100|75x75|icon_/.test(url)) return false;
+  const w = candidate.width || 0;
+  const h = candidate.height || 0;
+  // Si SÍ declara tamaño, debe cumplir el mínimo obligatorio. Si no declara
+  // tamaño (muchas fuentes no lo exponen en su respuesta), se deja pasar al
+  // pool y es el scoring de resolución el que la penaliza frente a otras
+  // candidatas que sí prueben ser grandes.
+  if (w && w < MIN_IMAGE_DIMENSION) return false;
+  if (h && h < MIN_IMAGE_DIMENSION * 0.5) return false;
+  return true;
+}
+
+// --- Fuentes con API pública JSON y CORS abierto (consulta directa) ---
+
+async function searchDanbooruLike(baseUrl, query, sourceLabel, limit = 6){
+  try{
+    const tags = query.split(/\s+/).slice(0, 2).join("+"); // boorus limitan combinaciones de tags
+    const url = `${baseUrl}?limit=${limit}&tags=${encodeURIComponent(tags)}`;
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) return [];
+    const json = await res.json();
+    const arr = Array.isArray(json) ? json : (json.posts || []);
+    return arr.map(p => ({
+      url: p.file_url || p.large_file_url || p.sample_url || p.jpeg_url || "",
+      width: p.image_width || p.width || p.sample_width || 0,
+      height: p.image_height || p.height || p.sample_height || 0,
+      matchText: [p.tag_string, p.tags, query].filter(Boolean).join(" "),
+      qualityHint: p.score > 20 ? 0.85 : 0.6,
+      sourceLabel
+    })).filter(c => c.url);
+  }catch(e){ return []; }
+}
+
+async function searchWallhaven(query, limit = 6){
+  try{
+    const url = `https://wallhaven.cc/api/v1/search?q=${encodeURIComponent(query)}&sorting=relevance&categories=010&purity=100`;
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) return [];
+    const json = await res.json();
+    return (json.data || []).slice(0, limit).map(p => ({
+      url: p.path || "",
+      width: p.dimension_x || 0,
+      height: p.dimension_y || 0,
+      matchText: (p.tags || []).map(t => t.name).join(" ") + " " + query,
+      qualityHint: 0.75,
+      sourceLabel: "Wallhaven"
+    })).filter(c => c.url);
+  }catch(e){ return []; }
+}
+
+async function searchWikimediaCommons(query, limit = 5){
+  try{
+    const url = `https://commons.wikimedia.org/w/api.php?action=query&format=json&origin=*&generator=search&gsrsearch=${encodeURIComponent(query)}&gsrnamespace=6&gsrlimit=${limit}&prop=imageinfo&iiprop=url|size&iiurlwidth=1920`;
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) return [];
+    const json = await res.json();
+    const pages = json?.query?.pages || {};
+    return Object.values(pages).map(p => {
+      const info = (p.imageinfo || [])[0];
+      if (!info) return null;
+      return {
+        url: info.url || info.thumburl || "",
+        width: info.width || 0,
+        height: info.height || 0,
+        matchText: p.title + " " + query,
+        qualityHint: 0.7,
+        sourceLabel: "Wikimedia Commons"
+      };
+    }).filter(Boolean).filter(c => c.url);
+  }catch(e){ return []; }
+}
+
+// --- Fuentes sin API pública / con CORS cerrado: se consultan a través del
+// proxy CORS ya usado por el proyecto para RSS, extrayendo las imágenes
+// disponibles en su HTML público. Si el proxy o el parseo fallan, la fuente
+// simplemente no aporta candidatos (no interrumpe el resto de la búsqueda).
+async function searchViaProxyHtml(pageUrl, sourceLabel, imgRegex, limit = 6){
+  try{
+    const html = await fetchWithCorsProxy(pageUrl);
+    const found = [];
+    let m;
+    const re = new RegExp(imgRegex, "gi");
+    while ((m = re.exec(html)) && found.length < limit){
+      const url = (m[1] || "").replace(/&amp;/g, "&");
+      if (!url || found.some(f => f.url === url)) continue;
+      found.push({
+        url,
+        width: 0,
+        height: 0,
+        matchText: sourceLabel,
+        qualityHint: 0.55,
+        sourceLabel
+      });
+    }
+    return found;
+  }catch(e){ return []; }
+}
+
+function searchZerochan(query, limit = 6){
+  const url = `https://www.zerochan.net/${encodeURIComponent(query)}`;
+  return searchViaProxyHtml(url, "Zerochan", 'class="thumb"[^>]*>\\s*<img[^>]*src="([^"]+)"', limit);
+}
+function searchAnimePictures(query, limit = 6){
+  const url = `https://anime-pictures.net/pictures/search?search_tag=${encodeURIComponent(query)}`;
+  return searchViaProxyHtml(url, "Anime-Pictures", 'data-src="([^"]+\\.(?:jpg|jpeg|png|webp))"', limit);
+}
+function searchPinterest(query, limit = 6){
+  const url = `https://www.pinterest.com/search/pins/?q=${encodeURIComponent(query)}`;
+  return searchViaProxyHtml(url, "Pinterest", '"url":"(https:\\/\\/i\\.pinimg\\.com\\/[^"]+)"', limit);
+}
+function searchDeviantArt(query, limit = 6){
+  const url = `https://www.deviantart.com/search?q=${encodeURIComponent(query)}`;
+  return searchViaProxyHtml(url, "DeviantArt", 'src="(https:\\/\\/images-wixmp[^"]+)"', limit);
+}
+function searchArtStation(query, limit = 6){
+  const url = `https://www.artstation.com/search?q=${encodeURIComponent(query)}`;
+  return searchViaProxyHtml(url, "ArtStation", '"(https:\\/\\/cdna?\\.artstation\\.com\\/[^"]+\\.(?:jpg|jpeg|png))"', limit);
+}
+function searchBingImages(query, limit = 6){
+  const url = `https://www.bing.com/images/search?q=${encodeURIComponent(query)}&form=HDRSC2`;
+  return searchViaProxyHtml(url, "Bing Images", 'murl&quot;:&quot;(https?:\\/\\/[^&]+?\\.(?:jpg|jpeg|png|webp))&quot;', limit);
+}
+function searchPixiv(query, limit = 6){
+  // Pixiv exige sesión/cookies para su API de búsqueda; su página pública de
+  // ranking sí es accesible vía proxy y sirve como aproximación temática
+  // cuando el query coincide con tendencias actuales.
+  const url = `https://www.pixiv.net/ranking.php?mode=daily&content=illust`;
+  return searchViaProxyHtml(url, "Pixiv", 'data-src="([^"]+)"', limit);
+}
+
+// Punto único de orquestación: arma el pool de candidatas consultando TODAS
+// las fuentes en paralelo (RSS incluido, sin prioridad), filtra, puntúa y
+// elige la mejor. Devuelve { url, isFallback, sourceLabel }.
+async function selectBestImageForItem(item){
+  const query = buildImageSearchQuery(item.title);
+  const queryWords = query.split(/\s+/).filter(Boolean);
+  const intent = detectImageIntent(item);
+
+  const candidates = [];
+
+  // La imagen que ya trae el RSS (si la trae) entra como una candidata más,
+  // marcada como "oficial/del artículo" para la regla especial de
+  // visuales/pósters/tráilers, pero SIN saltarse el resto de la búsqueda.
+  if (item.image){
+    candidates.push({
+      url: item.image,
+      width: 0,
+      height: 0,
+      matchText: item.title,
+      qualityHint: 0.65,
+      isOriginalRss: true,
+      sourceLabel: item.source || "Fuente original"
+    });
+  }
+
+  const searches = [
+    findFallbackImageForTitle(item.title).then(url => url ? [{
+      url, width: 0, height: 0, matchText: item.title, qualityHint: 0.8,
+      isOriginalRss: true, sourceLabel: "MAL/AniList (oficial)"
+    }] : []),
+    searchDanbooruLike("https://danbooru.donmai.us/posts.json", query, "Danbooru"),
+    searchDanbooruLike("https://safebooru.donmai.us/posts.json", query, "Safebooru"),
+    searchDanbooruLike("https://konachan.com/post.json", query, "Konachan"),
+    searchWallhaven(query),
+    searchWikimediaCommons(query),
+    searchZerochan(query),
+    searchAnimePictures(query),
+    searchPinterest(query),
+    searchDeviantArt(query),
+    searchArtStation(query),
+    searchBingImages(query),
+    searchPixiv(query)
+  ];
+
+  const settled = await Promise.allSettled(searches);
+  settled.forEach(r => { if (r.status === "fulfilled") candidates.push(...r.value); });
+
+  let pool = candidates.filter(passesMandatoryFilters);
+
+  // Regla especial: contenido de visual/póster/tráiler/teaser oficial →
+  // se prioriza fuertemente la imagen oficial (RSS/MAL/AniList) sobre arte
+  // de fans/wallpapers, sin descartar por completo el resto del pool.
+  if (intent === "official"){
+    const officialPool = pool.filter(c => c.isOriginalRss);
+    if (officialPool.length) pool = officialPool;
+  }
+  // Para curiosidad/debate/comparación/ranking/polémica no se restringe nada:
+  // cualquier imagen bien relacionada (fanart, wallpaper, ilustración) vale.
+
+  if (pool.length === 0){
+    const fallbackUrl = FALLBACK_IMAGE_BY_CAT[item.category] || FALLBACK_IMAGE_BY_CAT["anime"];
+    return { url: fallbackUrl, isFallback: true, sourceLabel: "Respaldo genérico" };
+  }
+
+  let best = pool[0];
+  let bestScore = -1;
+  pool.forEach(c => {
+    const s = scoreImageCandidate(c, queryWords);
+    if (s > bestScore){ bestScore = s; best = c; }
+  });
+
+  return {
+    url: upgradeImageUrl(best.url),
+    isFallback: false,
+    sourceLabel: best.sourceLabel || "Búsqueda multifuente"
+  };
 }
 
 // Cuando un ítem (normalmente de RSS) no trae imagen, intenta encontrar una imagen
