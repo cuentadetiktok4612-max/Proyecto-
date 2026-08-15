@@ -1655,12 +1655,10 @@ async function onGenerateClick(){
       const result = await selectBestImageForItem(item);
       item.image = result.url;
       item.imageIsFallback = result.isFallback;
-      item.imageIsAiGenerated = !!result.isAiGenerated;
     }catch(e){
       log(`Búsqueda de imagen falló para "${item.title}" (${e.message || e}). Usando imagen de respaldo.`, "warn");
       item.image = FALLBACK_IMAGE_BY_CAT[item.category] || FALLBACK_IMAGE_BY_CAT["anime"];
       item.imageIsFallback = true;
-      item.imageIsAiGenerated = false;
     }
 
     // Escalonado por ítem para no saturar el límite de peticiones por
@@ -2331,9 +2329,16 @@ const IMAGE_SEARCH_STOPWORDS = new Set([
 ]);
 function buildImageSearchQuery(title){
   const words = (title || "")
-    .replace(/[«»"“”'’:,.!¿?()\[\]]/g, " ")
+    .replace(/[«»""''´:,.!¿?()\[\]]/g, " ")
     .split(/\s+/)
-    .filter(w => w.length > 2 && !IMAGE_SEARCH_STOPWORDS.has(w.toLowerCase()));
+    // Antes se exigía length > 2, lo cual descartaba números sueltos como
+    // el "3" de "Mass Effect 3: Citadel" — perdiendo el número de entrega
+    // que suele ser la parte más distintiva del título (sin él, "Citadel"
+    // a secas es ambiguo con lugares reales, como pasó con una ciudadela
+    // de Alepo devuelta por Wikimedia en vez de arte del juego). Ahora se
+    // permite cualquier token alfanumérico de largo 1+ que sea puramente
+    // numérico, y se mantiene el mínimo de 3 para palabras normales.
+    .filter(w => (/^\d+$/.test(w)) || (w.length > 2 && !IMAGE_SEARCH_STOPWORDS.has(w.toLowerCase())));
   return words.slice(0, 6).join(" ").trim() || (title || "").slice(0, 40);
 }
 
@@ -2389,7 +2394,10 @@ function scoreImageCandidate(candidate, queryWords){
 // Filtros obligatorios: fuera miniaturas, imágenes borrosas/comprimidas y
 // resoluciones bajas. No se recorta ni se reescala nada; el filtro solo
 // decide si una URL entra o no al pool de candidatas.
-function passesMandatoryFilters(candidate){
+// queryWords se usa solo para la salvaguarda de weakTextMatch (ver abajo);
+// candidatas que no la traen (undefined) se comportan exactamente igual
+// que antes.
+function passesMandatoryFilters(candidate, queryWords){
   const url = (candidate.url || "").toLowerCase();
   if (!url) return false;
   if (looksLikeIconOrTracker(url, { getAttribute: () => null })) return false;
@@ -2402,14 +2410,39 @@ function passesMandatoryFilters(candidate){
   // candidatas que sí prueben ser grandes.
   if (w && w < MIN_IMAGE_DIMENSION) return false;
   if (h && h < MIN_IMAGE_DIMENSION * 0.5) return false;
+
+  // Salvaguarda contra falsos positivos de texto libre (Wikimedia): una
+  // sola palabra coincidente (p.ej. "Citadel" matcheando una ciudadela real
+  // de Alepo en vez de arte de "Mass Effect 3: Citadel") no es suficiente
+  // señal de que el tema sea el correcto. Se exige al menos 2 coincidencias
+  // cuando hay 2+ palabras de query disponibles; con una sola palabra de
+  // query no hay forma de exigir 2, así que se deja pasar (el score bajo
+  // la penaliza igual frente a mejores candidatas).
+  if (candidate.weakTextMatch && Array.isArray(queryWords) && queryWords.length >= 2){
+    const text = (candidate.matchText || "").toLowerCase();
+    const hits = queryWords.filter(qw => text.includes(qw.toLowerCase())).length;
+    if (hits < 2) return false;
+  }
+
   return true;
 }
 
 // --- Fuentes con API pública JSON y CORS abierto (consulta directa) ---
 
-async function searchDanbooruLike(baseUrl, query, sourceLabel, limit = 6){
+// baseUrl: endpoint de la API. sourceLabel: nombre a mostrar. minWidth: filtro
+// de resolución nativo del booru (width:>=N) — se pide EN el servidor, no se
+// filtra después, así se aprovecha el volumen real del sitio en vez de
+// descartar la mayoría de una muestra pequeña. sortByScore: agrega
+// order:score para traer primero lo mejor puntuado por la comunidad
+// (proxy razonable de "buena calidad/composición", no solo resolución).
+async function searchDanbooruLike(baseUrl, query, sourceLabel, limit = 6, minWidth = 0, sortByScore = true){
   try{
-    const tags = query.split(/\s+/).slice(0, 2).join("+"); // boorus limitan combinaciones de tags
+    const topicTags = query.split(/\s+/).slice(0, 2).join(" "); // boorus limitan combinaciones de tags temáticos
+    const metaTags = [
+      minWidth ? `width:>=${minWidth}` : "",
+      sortByScore ? "order:score" : ""
+    ].filter(Boolean).join(" ");
+    const tags = [topicTags, metaTags].filter(Boolean).join("+").replace(/\s+/g, "+");
     const url = `${baseUrl}?limit=${limit}&tags=${encodeURIComponent(tags)}`;
     const res = await fetch(url, { cache: "no-store" });
     if (!res.ok) return [];
@@ -2419,12 +2452,44 @@ async function searchDanbooruLike(baseUrl, query, sourceLabel, limit = 6){
       url: p.file_url || p.large_file_url || p.sample_url || p.jpeg_url || "",
       width: p.image_width || p.width || p.sample_width || 0,
       height: p.image_height || p.height || p.sample_height || 0,
-      matchText: [p.tag_string, p.tags, query].filter(Boolean).join(" "),
+      matchText: [p.tag_string, p.tags].filter(Boolean).join(" "),
       qualityHint: p.score > 20 ? 0.85 : 0.6,
       sourceLabel
     })).filter(c => c.url);
   }catch(e){ return []; }
 }
+
+// Gelbooru usa un formato de API propio (index.php?page=dapi&s=post&q=index
+// &json=1), distinto al posts.json/post.json de Danbooru/Moebooru, así que
+// necesita su propio parseo — no es compatible con searchDanbooruLike.
+// Sin proxy, API JSON directa, igual de confiable que Danbooru/Konachan.
+// Mismo filtro de resolución nativo (width:>=N) y orden por score que
+// searchDanbooruLike — Gelbooru soporta la misma sintaxis de meta-tags.
+async function searchGelbooru(query, limit = 6, minWidth = 0){
+  try{
+    const topicTags = query.split(/\s+/).slice(0, 2).join(" ");
+    const metaTags = [
+      minWidth ? `width:>=${minWidth}` : "",
+      "sort:score:desc"
+    ].filter(Boolean).join(" ");
+    const tags = [topicTags, metaTags].filter(Boolean).join("+").replace(/\s+/g, "+");
+    const url = `https://gelbooru.com/index.php?page=dapi&s=post&q=index&json=1&limit=${limit}&tags=${encodeURIComponent(tags)}`;
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) return [];
+    const json = await res.json();
+    const arr = Array.isArray(json) ? json : (json.post || []);
+    return arr.map(p => ({
+      url: p.file_url || p.sample_url || p.preview_url || "",
+      width: p.width || p.sample_width || 0,
+      height: p.height || p.sample_height || 0,
+      matchText: p.tags || "",
+      qualityHint: p.score > 20 ? 0.85 : 0.6,
+      sourceLabel: "Gelbooru"
+    })).filter(c => c.url);
+  }catch(e){ return []; }
+}
+
+
 
 async function searchWallhaven(query, limit = 6){
   try{
@@ -2436,7 +2501,7 @@ async function searchWallhaven(query, limit = 6){
       url: p.path || "",
       width: p.dimension_x || 0,
       height: p.dimension_y || 0,
-      matchText: (p.tags || []).map(t => t.name).join(" ") + " " + query,
+      matchText: (p.tags || []).map(t => t.name).join(" "),
       qualityHint: 0.75,
       sourceLabel: "Wallhaven"
     })).filter(c => c.url);
@@ -2457,9 +2522,15 @@ async function searchWikimediaCommons(query, limit = 5){
         url: info.url || info.thumburl || "",
         width: info.width || 0,
         height: info.height || 0,
-        matchText: p.title + " " + query,
+        matchText: p.title || "",
+        // Wikimedia es texto libre (búsqueda por relevancia sobre nombre de
+        // archivo/descripción), no tags curados como un booru. Se marca para
+        // que passesMandatoryFilters exija más de 1 palabra coincidente:
+        // "Citadel" sola puede traer una foto real de una ciudadela en vez
+        // de arte del juego "Mass Effect 3: Citadel" — pasó en producción.
         qualityHint: 0.7,
-        sourceLabel: "Wikimedia Commons"
+        sourceLabel: "Wikimedia Commons",
+        weakTextMatch: true
       };
     }).filter(Boolean).filter(c => c.url);
   }catch(e){ return []; }
@@ -2470,86 +2541,17 @@ async function searchWikimediaCommons(query, limit = 5){
 // disponibles en su HTML público. Si el proxy o el parseo fallan, la fuente
 // simplemente no aporta candidatos (no interrumpe el resto de la búsqueda).
 //
-// A diferencia de fetchWithCorsProxy (usado por el RSS, que prueba los dos
-// proxies en serie con 12s cada uno), aquí se usa un timeout más corto por
-// proxy (5s) para no acumular demasiado tiempo, pero SÍ se prueba el
-// segundo proxy si el primero falla — con solo 2 proxies disponibles,
-// rendirse tras el primero desperdicia la mitad de las oportunidades reales
-// de conseguir una imagen cuando uno de los dos está temporalmente saturado.
-async function fetchWithCorsProxyFast(targetUrl, timeoutMs = 5000){
-  let lastError;
-  for (const proxy of CORS_PROXIES){
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    try{
-      const res = await fetch(proxy + encodeURIComponent(targetUrl), {
-        cache: "no-store",
-        signal: controller.signal
-      });
-      clearTimeout(timer);
-      if (!res.ok) { lastError = new Error("HTTP " + res.status); continue; }
-      return await res.text();
-    }catch(e){
-      clearTimeout(timer);
-      lastError = e;
-    }
-  }
-  throw lastError || new Error("Todos los proxies CORS fallaron");
-}
-
-async function searchViaProxyHtml(pageUrl, sourceLabel, imgRegex, limit = 6){
-  try{
-    const html = await fetchWithCorsProxyFast(pageUrl);
-    const found = [];
-    let m;
-    const re = new RegExp(imgRegex, "gi");
-    while ((m = re.exec(html)) && found.length < limit){
-      const url = (m[1] || "").replace(/&amp;/g, "&");
-      if (!url || found.some(f => f.url === url)) continue;
-      found.push({
-        url,
-        width: 0,
-        height: 0,
-        matchText: sourceLabel,
-        qualityHint: 0.55,
-        sourceLabel
-      });
-    }
-    return found;
-  }catch(e){ return []; }
-}
-
-function searchZerochan(query, limit = 6){
-  const url = `https://www.zerochan.net/${encodeURIComponent(query)}`;
-  return searchViaProxyHtml(url, "Zerochan", 'class="thumb"[^>]*>\\s*<img[^>]*src="([^"]+)"', limit);
-}
-function searchAnimePictures(query, limit = 6){
-  const url = `https://anime-pictures.net/pictures/search?search_tag=${encodeURIComponent(query)}`;
-  return searchViaProxyHtml(url, "Anime-Pictures", 'data-src="([^"]+\\.(?:jpg|jpeg|png|webp))"', limit);
-}
-function searchPinterest(query, limit = 6){
-  const url = `https://www.pinterest.com/search/pins/?q=${encodeURIComponent(query)}`;
-  return searchViaProxyHtml(url, "Pinterest", '"url":"(https:\\/\\/i\\.pinimg\\.com\\/[^"]+)"', limit);
-}
-function searchDeviantArt(query, limit = 6){
-  const url = `https://www.deviantart.com/search?q=${encodeURIComponent(query)}`;
-  return searchViaProxyHtml(url, "DeviantArt", 'src="(https:\\/\\/images-wixmp[^"]+)"', limit);
-}
-function searchArtStation(query, limit = 6){
-  const url = `https://www.artstation.com/search?q=${encodeURIComponent(query)}`;
-  return searchViaProxyHtml(url, "ArtStation", '"(https:\\/\\/cdna?\\.artstation\\.com\\/[^"]+\\.(?:jpg|jpeg|png))"', limit);
-}
-function searchBingImages(query, limit = 6){
-  const url = `https://www.bing.com/images/search?q=${encodeURIComponent(query)}&form=HDRSC2`;
-  return searchViaProxyHtml(url, "Bing Images", 'murl&quot;:&quot;(https?:\\/\\/[^&]+?\\.(?:jpg|jpeg|png|webp))&quot;', limit);
-}
-function searchPixiv(query, limit = 6){
-  // Pixiv exige sesión/cookies para su API de búsqueda; su página pública de
-  // ranking sí es accesible vía proxy y sirve como aproximación temática
-  // cuando el query coincide con tendencias actuales.
-  const url = `https://www.pixiv.net/ranking.php?mode=daily&content=illust`;
-  return searchViaProxyHtml(url, "Pixiv", 'data-src="([^"]+)"', limit);
-}
+// NOTA: hasta esta versión, aquí vivían fetchWithCorsProxyFast,
+// searchViaProxyHtml y 7 fuentes que dependían de ella (Zerochan,
+// Anime-Pictures, Pinterest, DeviantArt, ArtStation, Bing Images, Pixiv) — todas vía scraping de HTML a través de
+// CORS_PROXIES + regex. Se eliminaron: en el log real de producción casi
+// siempre eran justamente estas 7 las que fallaban ("2/4 imágenes"),
+// porque dependían de 2 proxies CORS gratuitos compartidos y de regex
+// frágiles sobre HTML de sitios con fuerte anti-scraping (Pinterest, Bing,
+// ArtStation cargan imágenes vía JS, no en el HTML inicial). Se
+// reemplazaron por Gelbooru y Yande.re (ver más abajo y en el array
+// `searches`), que tienen API JSON directa igual de confiable que
+// Danbooru/Konachan, sin depender de ningún proxy.
 
 // Envuelve cualquier promesa de búsqueda con un timeout propio: si esa
 // fuente concreta no responde a tiempo, se resuelve a lista vacía en vez de
@@ -2564,9 +2566,11 @@ function withTimeout(promise, ms){
 
 // Tiempo máximo total que se le da a la búsqueda de imagen de UNA
 // publicación antes de resignarse a usar lo que ya se tenga (o el
-// fallback). Protege la generación completa de quedar bloqueada si los
-// proxies CORS compartidos están saturados o caídos.
-const IMAGE_SEARCH_HARD_TIMEOUT_MS = 13000;
+// fallback). Ya no hay fuentes vía proxy (eliminadas — ver nota en
+// searchGelbooru/array `searches`), así que todas las fuentes actuales
+// usan timeout individual de 7s; el margen de 13s existía para dar
+// tiempo a las fuentes de 11s que dependían de fetchWithCorsProxyFast.
+const IMAGE_SEARCH_HARD_TIMEOUT_MS = 9000;
 
 // Mide las dimensiones REALES de una imagen cargándola en el navegador,
 // en vez de confiar solo en los metadatos que reporta cada fuente (varias,
@@ -2640,29 +2644,31 @@ async function selectBestImageForItem(item){
       });
     }
 
-    // Fuentes directas (API JSON pública, sin proxy): timeout individual de
-    // 7s, suelen responder rápido y son las más fiables.
-    // Fuentes vía proxy HTML: timeout de 11s, dando margen a que
-    // fetchWithCorsProxyFast pruebe los 2 proxies disponibles (5s cada uno)
-    // antes de rendirse — con solo 2 proxies gratuitos, intentar ambos
-    // duplica las chances reales de conseguir imagen cuando uno está caído.
+    // Todas las fuentes de aquí abajo son API JSON directa (sin proxy, sin
+    // scraping de HTML): Danbooru, Safebooru, Konachan y Yande.re comparten
+    // formato Danbooru/Moebooru; Gelbooru tiene su propio formato pero
+    // también API JSON directa. Limit subido a 10 (antes 6): con menos
+    // fuentes en la lista total, cada una puede aportar más candidatas al
+    // pool sin saturarlo de ruido — esto es lo que de verdad ataca el
+    // problema de "solo 2/4 con imagen": antes, la mitad de las 13 fuentes
+    // (7 vía proxy CORS + regex sobre HTML) fallaban casi siempre en
+    // producción porque dependían de 2 proxies gratuitos compartidos y de
+    // sitios con fuerte anti-scraping (Pinterest/Bing/ArtStation cargan
+    // imágenes vía JS, no en el HTML que el proxy devuelve). Se
+    // reemplazaron por Gelbooru y Yande.re, con la misma fiabilidad
+    // comprobada que Danbooru/Konachan.
     const searches = [
       withTimeout(findFallbackImageForTitle(item.title).then(url => url ? [{
         url, width: 0, height: 0, matchText: item.title, qualityHint: 0.8,
         isOriginalRss: true, sourceLabel: "MAL/AniList (oficial)"
       }] : []).catch(() => []), 7000),
-      withTimeout(searchDanbooruLike("https://danbooru.donmai.us/posts.json", query, "Danbooru"), 7000),
-      withTimeout(searchDanbooruLike("https://safebooru.donmai.us/posts.json", query, "Safebooru"), 7000),
-      withTimeout(searchDanbooruLike("https://konachan.com/post.json", query, "Konachan"), 7000),
+      withTimeout(searchDanbooruLike("https://danbooru.donmai.us/posts.json", query, "Danbooru", 10, MIN_IMAGE_DIMENSION), 7000),
+      withTimeout(searchDanbooruLike("https://safebooru.donmai.us/posts.json", query, "Safebooru", 10, MIN_IMAGE_DIMENSION), 7000),
+      withTimeout(searchDanbooruLike("https://konachan.com/post.json", query, "Konachan", 10, MIN_IMAGE_DIMENSION), 7000),
+      withTimeout(searchDanbooruLike("https://yande.re/post.json", query, "Yande.re", 10, MIN_IMAGE_DIMENSION), 7000),
+      withTimeout(searchGelbooru(query, 10, MIN_IMAGE_DIMENSION), 7000),
       withTimeout(searchWallhaven(query), 7000),
-      withTimeout(searchWikimediaCommons(query), 7000),
-      withTimeout(searchZerochan(query), 11000),
-      withTimeout(searchAnimePictures(query), 11000),
-      withTimeout(searchPinterest(query), 11000),
-      withTimeout(searchDeviantArt(query), 11000),
-      withTimeout(searchArtStation(query), 11000),
-      withTimeout(searchBingImages(query), 11000),
-      withTimeout(searchPixiv(query), 11000)
+      withTimeout(searchWikimediaCommons(query), 7000)
     ];
 
     // Límite duro sobre el conjunto: si por lo que sea las promesas
@@ -2676,7 +2682,7 @@ async function selectBestImageForItem(item){
       });
     }
 
-    let pool = candidates.filter(passesMandatoryFilters);
+    let pool = candidates.filter(c => passesMandatoryFilters(c, queryWords));
     log(`Imagen "${item.title.slice(0,40)}…": ${candidates.length} candidatas encontradas, ${pool.length} pasan filtros.`, pool.length ? "ok" : "warn");
 
     // Regla especial: contenido de visual/póster/tráiler/teaser oficial →
@@ -2690,15 +2696,32 @@ async function selectBestImageForItem(item){
     // cualquier imagen bien relacionada (fanart, wallpaper, ilustración) vale.
 
     if (pool.length === 0){
-      log(`Imagen "${item.title.slice(0,40)}…": ninguna candidata pasó los filtros, generando con IA (Pollinations)…`, "warn");
-      const aiUrl = await generateImageWithPollinations(item);
-      if (aiUrl){
-        log(`Imagen "${item.title.slice(0,40)}…": generada con IA.`, "ok");
-        return { url: aiUrl, isFallback: false, isAiGenerated: true, sourceLabel: "Generada con IA" };
+      // Reintento con query relajado: un título muy específico ("Mass
+      // Effect 3 Citadel") puede no tener ningún resultado exacto en los
+      // boorus, pero una versión más corta (solo 1-2 palabras clave del
+      // franchise/tema) sí suele encontrar arte relacionado. Se reintenta
+      // contra Danbooru/Safebooru/Gelbooru (las de mayor volumen de
+      // contenido) antes de rendirse al respaldo genérico.
+      const relaxedQuery = queryWords.slice(0, 2).join(" ");
+      if (relaxedQuery && relaxedQuery !== query){
+        log(`Imagen "${item.title.slice(0,40)}…": sin resultados con el query completo, reintentando con "${relaxedQuery}"…`, "warn");
+        const relaxedSearches = await Promise.allSettled([
+          withTimeout(searchDanbooruLike("https://danbooru.donmai.us/posts.json", relaxedQuery, "Danbooru", 10, MIN_IMAGE_DIMENSION), 7000),
+          withTimeout(searchDanbooruLike("https://safebooru.donmai.us/posts.json", relaxedQuery, "Safebooru", 10, MIN_IMAGE_DIMENSION), 7000),
+          withTimeout(searchGelbooru(relaxedQuery, 10, MIN_IMAGE_DIMENSION), 7000)
+        ]);
+        const relaxedCandidates = [];
+        relaxedSearches.forEach(r => {
+          if (r.status === "fulfilled" && Array.isArray(r.value)) relaxedCandidates.push(...r.value);
+        });
+        pool = relaxedCandidates.filter(c => passesMandatoryFilters(c, queryWords.slice(0, 2)));
+        log(`Imagen "${item.title.slice(0,40)}…": reintento con query relajado encontró ${pool.length} candidatas.`, pool.length ? "ok" : "warn");
       }
-      const fallbackUrl = FALLBACK_IMAGE_BY_CAT[item.category] || FALLBACK_IMAGE_BY_CAT["anime"];
-      log(`Imagen "${item.title.slice(0,40)}…": la generación con IA también falló, usando respaldo por categoría.`, "warn");
-      return { url: fallbackUrl, isFallback: true, sourceLabel: "Respaldo genérico" };
+      if (pool.length === 0){
+        const fallbackUrl = FALLBACK_IMAGE_BY_CAT[item.category] || FALLBACK_IMAGE_BY_CAT["anime"];
+        log(`Imagen "${item.title.slice(0,40)}…": ninguna candidata pasó los filtros ni con query relajado, usando respaldo por categoría.`, "warn");
+        return { url: fallbackUrl, isFallback: true, sourceLabel: "Respaldo genérico" };
+      }
     }
 
     let best = pool[0];
@@ -2730,14 +2753,8 @@ async function selectBestImageForItem(item){
     }
 
     if (!verifiedCandidate){
-      log(`Imagen "${item.title.slice(0,40)}…": ninguna candidata superó la verificación real de resolución, generando con IA (Pollinations)…`, "warn");
-      const aiUrl = await generateImageWithPollinations(item);
-      if (aiUrl){
-        log(`Imagen "${item.title.slice(0,40)}…": generada con IA.`, "ok");
-        return { url: aiUrl, isFallback: false, isAiGenerated: true, sourceLabel: "Generada con IA" };
-      }
       const fallbackUrl = FALLBACK_IMAGE_BY_CAT[item.category] || FALLBACK_IMAGE_BY_CAT["anime"];
-      log(`Imagen "${item.title.slice(0,40)}…": la generación con IA también falló, usando respaldo por categoría.`, "warn");
+      log(`Imagen "${item.title.slice(0,40)}…": ninguna candidata superó la verificación real de resolución, usando respaldo por categoría.`, "warn");
       return { url: fallbackUrl, isFallback: true, sourceLabel: "Respaldo genérico" };
     }
 
@@ -2827,52 +2844,6 @@ const ICON_BY_CAT = {
 // así siempre cae una imagen temática consistente y sin depender de terceros con key).
 // Se usan SOLO cuando la fuente original no trae ninguna imagen y no se encontró
 // una imagen relacionada al título vía AniList/Jikan (ver findFallbackImageForTitle).
-// Estilo visual por categoría para el prompt de generación por IA. Se
-// reusa la misma idea de CATEGORY_STYLE que existía en el backend de
-// Cloudflare (ya eliminado): mapear la categoría de la publicación a un
-// lenguaje de estilo que el modelo de imagen entienda bien.
-const AI_IMAGE_CATEGORY_STYLE = {
-  anime: "vibrant modern anime style, cinematic lighting",
-  manga: "manga art style, dynamic black and white illustration with color accents",
-  manhwa: "korean manhwa style, clean lines, soft modern color palette",
-  videojuegos: "video game concept art style, dramatic lighting, game cover composition",
-  colaboraciones: "vibrant modern anime style, dynamic composition",
-  polemicas: "vibrant modern anime style, dramatic mood lighting",
-  adaptaciones: "vibrant modern anime style, cinematic lighting",
-  "live-action": "cinematic movie poster style, dramatic lighting",
-  curiosidades: "otaku pop art style, bold vivid colors",
-  estrenos: "vibrant modern anime style, cinematic lighting, premiere poster feel"
-};
-
-// Genera una imagen con IA vía Pollinations (sin API key, sin costo) cuando
-// la búsqueda multifuente no encontró ninguna imagen real de buena calidad
-// para la publicación. Se arma un prompt a partir del título y la
-// categoría, nunca pidiendo personajes con nombre propio o IP específica,
-// para mantenerse en arte genérico relacionado al tema.
-// Devuelve la URL de la imagen generada, o null si falla/tarda demasiado
-// (el llamador debe caer al respaldo genérico en ese caso).
-async function generateImageWithPollinations(item){
-  try{
-    const style = AI_IMAGE_CATEGORY_STYLE[item.category] || AI_IMAGE_CATEGORY_STYLE.anime;
-    const topic = (item.title || "").slice(0, 120);
-    const prompt = `original illustration inspired by the theme: ${topic}, ${style}, no text, no watermark, no logos, not based on any specific existing franchise or character, vertical portrait composition, professional social media cover quality`;
-    const seed = Math.floor(Math.random() * 1e9);
-    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=864&height=1080&seed=${seed}&nologo=true`;
-
-    // Pollinations genera "al vuelo": la URL solo resuelve cuando la imagen
-    // termina de generarse. Se confirma con una descarga real (con timeout)
-    // en vez de solo construir la URL, porque una URL que nunca carga
-    // dejaría la publicación con una imagen rota en vez de caer al respaldo.
-    const ok = await withTimeout(
-      fetch(url).then(res => res.ok && (res.headers.get("content-type") || "").startsWith("image/")),
-      25000
-    ).catch(() => false);
-
-    return ok ? url : null;
-  }catch(e){
-    return null;
-  }
-}
 
 const FALLBACK_IMAGE_BY_CAT = {
   "anime":            "https://picsum.photos/seed/otagen-anime/800/450",
@@ -3053,7 +3024,6 @@ async function buildPostWithAI(item){
     image: item.image,
     originalImage: item.image,
     imageIsFallback: !!item.imageIsFallback,
-    imageIsAiGenerated: !!item.imageIsAiGenerated,
     link: item.link,
     source: item.source,
     sourceIcon: item.sourceIcon || "newspaper",
@@ -3173,7 +3143,6 @@ function buildPostTemplate(item){
     image: item.image,
     originalImage: item.image,
     imageIsFallback: !!item.imageIsFallback,
-    imageIsAiGenerated: !!item.imageIsAiGenerated,
     link: item.link,
     source: item.source,
     sourceIcon: item.sourceIcon || "newspaper",
@@ -3212,8 +3181,6 @@ function renderFeed(){
     if (copyBtn) copyBtn.addEventListener("click", () => onCopyClick(p));
     const dlImgBtn = document.getElementById("dlimg-" + p.id);
     if (dlImgBtn) dlImgBtn.addEventListener("click", () => onDownloadImageClick(p));
-    const dlCardBtn = document.getElementById("dlcard-" + p.id);
-    if (dlCardBtn) dlCardBtn.addEventListener("click", () => onDownloadCardClick(p));
     const enhanceBtn = document.getElementById("enhance-" + p.id);
     if (enhanceBtn) enhanceBtn.addEventListener("click", () => onEnhanceImageClick(p));
     const uploadBtn = document.getElementById("upload-" + p.id);
@@ -3246,7 +3213,6 @@ function cardHtml(p){
         <span class="card-cat" style="color:${cat.color}">${svgIcon(catIcon)}${cat.label}</span>
         <span class="card-type">${svgIcon(type.icon)}${type.label}</span>
         ${p.imageIsFallback ? `<span class="card-fallback-flag">${svgIcon("layers")}Imagen de respaldo</span>` : ""}
-        ${p.imageIsAiGenerated ? `<span class="card-fallback-flag">${svgIcon("sparkles")}Generada con IA</span>` : ""}
         ${p.imageIsCustom ? `<span class="card-fallback-flag">${svgIcon("image")}Imagen propia</span>` : ""}
         ${p.imageIsLocalEdit ? `<span class="card-fallback-flag">${svgIcon("sparkles")}Mejorada</span>` : ""}
       </div>
@@ -3266,7 +3232,6 @@ function cardHtml(p){
         ${p.image ? `
         <div class="card-actions" style="margin-top:8px;">
           <button class="btn btn-ghost btn-sm" id="dlimg-${p.id}" style="flex:1;">${svgIcon("download")} Descargar imagen</button>
-          <button class="btn btn-ghost btn-sm" id="dlcard-${p.id}" style="flex:1;">${svgIcon("image")} Descargar tarjeta</button>
         </div>` : ""}
         <div class="card-actions" style="margin-top:8px;">
           <button class="btn btn-ghost btn-sm" id="enhance-${p.id}" style="flex:1;" ${p.image ? "" : "disabled"}>${svgIcon("sparkles")} Mejorar imagen</button>
@@ -3352,9 +3317,18 @@ function onUploadImageChange(p, event){
    ========================================================= */
 const BRAND = {
   bg: "#0A0A0F",
+  // Violeta pedido por el usuario para el título destacado y acentos,
+  // medido directamente de la imagen de referencia (#ca7df7) que
+  // proporcionó como estilo objetivo, sustituyendo el morado que tenía
+  // el diseño original de esa referencia.
   purple: "#7B2FE0",
-  purpleLight: "#B98CFF",
-  white: "#FFFFFF"
+  purpleLight: "#CA7DF7",
+  white: "#FFFFFF",
+  // Fondo casi negro con base violeta, y gris para subtítulos/footer,
+  // medidos igualmente de la referencia.
+  bgDeep: "#04000E",
+  bgPanel: "#180A23",
+  grayText: "#9A8FAE"
 };
 
 
@@ -3368,6 +3342,52 @@ const BRAND = {
 //     título y logo, igual que en la tarjeta descargable.
 // No inventa contenido nuevo ni reemplaza la imagen real por otra: solo
 // la pule. Devuelve un dataURL PNG, o null si no hay imagen base disponible.
+// Determina qué palabras del título destacar en violeta (BRAND.purpleLight)
+// dentro del bloque de título, replicando el estilo de la referencia visual
+// donde una frase clave del titular ("NUEVA PELÍCULA", "2 SEMANAS") queda en
+// violeta y el resto en blanco. Heurística sin IA: se prioriza cualquier
+// tramo con dígitos (fechas, números de entrega, cuentas regresivas — la
+// parte más "noticiable" de un titular), y si no hay ninguno, se usa la
+// primera palabra larga (>3 letras) como acento mínimo para que el título
+// no quede monocromático.
+function pickHighlightWords(titleWords){
+  const highlightIdx = new Set();
+  titleWords.forEach((w, i) => { if (/\d/.test(w)) highlightIdx.add(i); });
+  if (highlightIdx.size === 0){
+    const idx = titleWords.findIndex(w => w.replace(/[^\p{L}]/gu, "").length > 3);
+    if (idx >= 0) highlightIdx.add(idx);
+  }
+  return highlightIdx;
+}
+
+// Variante de wrap que conserva, por palabra, si debe pintarse en violeta o
+// blanco (ver pickHighlightWords), devolviendo líneas como arrays de
+// {text, highlight} en vez de strings planas. Mismo algoritmo de ancho que
+// computeWrappedLines, solo que arma segmentos en vez de una sola cadena.
+function wrapHighlightedTitle(ctx, title, maxWidth, maxLines){
+  const words = title.split(" ");
+  const highlightIdx = pickHighlightWords(words);
+  const lines = [];
+  let current = [];
+  let currentText = "";
+  words.forEach((word, i) => {
+    const test = currentText ? currentText + " " + word : word;
+    if (ctx.measureText(test).width > maxWidth && currentText){
+      lines.push(current);
+      current = [{ text: word, highlight: highlightIdx.has(i) }];
+      currentText = word;
+    } else {
+      current.push({ text: word, highlight: highlightIdx.has(i) });
+      currentText = test;
+    }
+  });
+  if (current.length) lines.push(current);
+  if (lines.length > maxLines){
+    return lines.slice(0, maxLines);
+  }
+  return lines;
+}
+
 async function composeLocalFallbackImage(p){
   const baseUrl = p.originalImage || p.image;
   if (!baseUrl) return null;
@@ -3375,7 +3395,9 @@ async function composeLocalFallbackImage(p){
   const img = await loadImageForCanvas(baseUrl);
 
   const canvas = document.createElement("canvas");
-  const W = 864, H = 1080; // mismo formato vertical usado en toda la app
+  // 4:5 vertical, mismo ratio que la referencia de estilo (1280×1600) y
+  // formato estándar de post de Instagram/Facebook.
+  const W = 1024, H = 1280;
   canvas.width = W; canvas.height = H;
   const ctx = canvas.getContext("2d");
 
@@ -3383,74 +3405,203 @@ async function composeLocalFallbackImage(p){
   const accent = CATEGORY_ACCENT[p.category] || BRAND.purpleLight;
   const catLabel = cat.label.toUpperCase();
 
-  // Paso 1: color base vía filtro nativo de Canvas (sin IA) al dibujar la
-  // imagen, cubriendo el lienzo completo. Se deja el contraste fuera de
-  // aquí porque el auto-nivel del paso 2 hace un trabajo mucho mejor
-  // (ajustado al histograma real de esta imagen en concreto).
+  // Fondo sólido casi negro con base violeta, cubriendo el lienzo completo
+  // ANTES de dibujar la imagen: así el borde/degradado de la imagen se
+  // funde con este mismo tono en vez de con un negro genérico.
+  ctx.fillStyle = BRAND.bgDeep;
+  ctx.fillRect(0, 0, W, H);
+
+  // La imagen ocupa la porción superior (no el lienzo completo), dejando
+  // espacio sólido abajo para título + subtítulo + footer, igual que en
+  // la referencia. Se mejora igual que antes (saturación/nitidez/niveles),
+  // pero ya no se estira a los 1280px completos.
+  const imgH = Math.round(H * 0.62);
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, 0, W, imgH);
+  ctx.clip();
   ctx.filter = "saturate(1.18) brightness(1.02)";
-  drawImageCover(ctx, img, 0, 0, W, H);
+  drawImageCover(ctx, img, 0, 0, W, imgH);
   ctx.filter = "none";
-
-  // Paso 2 y 3: auto-nivel de contraste + nitidez real (unsharp mask con
-  // reducción de ruido previa). Es lo más cercano a "mejorar calidad,
-  // nitidez y colores" que se puede lograr con Canvas 2D nativo, sin IA.
   try{
-    autoLevels(ctx, W, H);
-    enhanceSharpness(ctx, W, H);
+    autoLevels(ctx, W, imgH);
+    enhanceSharpness(ctx, W, imgH);
   }catch(e){ /* si el canvas quedó "tainted" por CORS, se sigue sin este realce */ }
+  ctx.restore();
 
-  // Degradado inferior, más alto y opaco que antes, para que el título
-  // con contorno siga siendo legible sobre cualquier imagen de fondo.
-  const gradH = Math.round(H * 0.48);
-  const grad = ctx.createLinearGradient(0, H - gradH, 0, H);
-  grad.addColorStop(0, "rgba(10,10,15,0)");
-  grad.addColorStop(1, "rgba(10,10,15,0.94)");
-  ctx.fillStyle = grad;
-  ctx.fillRect(0, H - gradH, W, gradH);
+  // Degradado amplio desde donde termina la imagen hasta bien entrado el
+  // bloque de texto, fundiéndose con BRAND.bgDeep — mismo efecto que la
+  // referencia, donde la imagen se oscurece progresivamente antes del
+  // texto en vez de cortar con un borde duro.
+  const fadeStart = Math.round(imgH * 0.72);
+  const fadeEnd = Math.round(imgH * 1.14);
+  const fade = ctx.createLinearGradient(0, fadeStart, 0, fadeEnd);
+  fade.addColorStop(0, "rgba(4,0,14,0)");
+  fade.addColorStop(1, BRAND.bgDeep);
+  ctx.fillStyle = fade;
+  ctx.fillRect(0, fadeStart, W, fadeEnd - fadeStart);
+  // Resto del lienzo bajo el degradado: sólido, ya cubierto al inicio,
+  // pero se refuerza por si drawImageCover pintó fuera de imgH por algún
+  // borde de redondeo.
+  ctx.fillStyle = BRAND.bgDeep;
+  ctx.fillRect(0, fadeEnd, W, H - fadeEnd);
 
-  // Etiqueta de categoría, cápsula con el acento propio de la categoría
-  // (mismo lenguaje visual que la tarjeta descargable).
-  ctx.font = "800 24px 'Segoe UI', sans-serif";
-  const catWidth = ctx.measureText(catLabel).width;
+  // --- Pill superior: "CATEGORÍA ✦ [logo] otagen" ---
+  const pillY = 46;
+  const pillH = 52;
+  ctx.font = "800 22px 'Segoe UI', sans-serif";
+  const catText = catLabel;
+  const catW = ctx.measureText(catText).width;
+  const sepText = "✦";
+  const brandText = "INFOTAKU";
+  ctx.font = "800 22px 'Segoe UI', sans-serif";
+  const sepW = ctx.measureText(sepText).width;
+  const brandW = ctx.measureText(brandText).width;
+  const logoSize = 28;
+  const gap = 14;
+  const totalW = catW + gap + sepW + gap + logoSize + 8 + brandW;
+  let px = (W - totalW) / 2;
+  const pillCenterY = pillY + pillH / 2;
+
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = BRAND.white;
+  ctx.font = "800 22px 'Segoe UI', sans-serif";
+  ctx.fillText(catText, px, pillCenterY);
+  px += catW + gap;
   ctx.fillStyle = accent;
-  roundRect(ctx, 28, 32, catWidth + 66, 48, 24);
-  ctx.fill();
-  ctx.fillStyle = BRAND.bg;
-  ctx.fillText("⚡ " + catLabel, 46, 65);
-
-  // Título superpuesto con contorno, anclado al pie, alternando blanco y
-  // el acento de categoría por línea.
-  const title = (p.headline || p.title).toUpperCase();
-  ctx.font = "900 44px 'Segoe UI', sans-serif";
-  const titleLines = wrapCanvasTextLines(ctx, title, W - 72, 4);
-  let ty = H - 48 - (titleLines.length - 1) * 52;
-  titleLines.forEach((line, i) => {
-    const color = (i % 2 === 0) ? BRAND.white : accent;
-    fillTextWithStroke(ctx, line, 36, ty, "rgba(0,0,0,0.55)", 8, color);
-    ty += 52;
-  });
-
-  // Logo pequeño en la esquina, con anillo de acento, como sello de marca.
+  ctx.fillText(sepText, px, pillCenterY);
+  px += sepW + gap;
   try{
     const logoImg = await loadImageForCanvas(INFOTAKU_LOGO_DATA_URL);
-    const logoSize = 44;
-    const lcx = W - 36 - logoSize / 2, lcy = 36 + logoSize / 2;
     ctx.save();
     ctx.beginPath();
-    ctx.arc(lcx, lcy, logoSize / 2 + 3, 0, Math.PI * 2);
-    ctx.strokeStyle = accent;
-    ctx.lineWidth = 2;
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.arc(lcx, lcy, logoSize / 2, 0, Math.PI * 2);
+    ctx.arc(px + logoSize / 2, pillCenterY, logoSize / 2, 0, Math.PI * 2);
     ctx.closePath();
     ctx.clip();
-    ctx.drawImage(logoImg, W - 36 - logoSize, 36, logoSize, logoSize);
+    ctx.drawImage(logoImg, px, pillCenterY - logoSize / 2, logoSize, logoSize);
     ctx.restore();
-  }catch(e){ /* el logo es decorativo; si falla, se omite sin interrumpir */ }
+  }catch(e){ /* logo decorativo; se omite si falla sin interrumpir */ }
+  px += logoSize + 8;
+  ctx.fillStyle = BRAND.white;
+  ctx.fillText(brandText, px, pillCenterY);
+  ctx.textBaseline = "alphabetic";
+
+  // --- Título grande, centrado, mayúsculas, con tramos en violeta ---
+  const title = (p.headline || p.title).toUpperCase();
+  const titleFontSize = 58;
+  ctx.font = `900 ${titleFontSize}px 'Segoe UI', sans-serif`;
+  const titleMaxWidth = W - 96;
+  const titleLines = wrapHighlightedTitle(ctx, title, titleMaxWidth, 4);
+  const lineHeight = titleFontSize * 1.08;
+
+  // El subtítulo (si hay summary) se ancla más abajo; el título se ancla a
+  // una posición fija bajo el degradado, no al pie del lienzo, para dejar
+  // espacio consistente al subtítulo y footer independientemente de
+  // cuántas líneas ocupe el título.
+  let ty = imgH + 118;
+  titleLines.forEach(lineWords => {
+    // Centrado: se mide el ancho total de la línea (todas las palabras +
+    // espacios) para calcular el punto de inicio en X antes de dibujar
+    // cada palabra con su color correspondiente.
+    const lineText = lineWords.map(w => w.text).join(" ");
+    const lineWidth = ctx.measureText(lineText).width;
+    let lx = (W - lineWidth) / 2;
+    lineWords.forEach((w, i) => {
+      const wordText = w.text + (i < lineWords.length - 1 ? " " : "");
+      const color = w.highlight ? BRAND.purpleLight : BRAND.white;
+      fillTextWithStroke(ctx, wordText, lx, ty, "rgba(0,0,0,0.5)", 6, color);
+      lx += ctx.measureText(wordText).width;
+    });
+    ty += lineHeight;
+  });
+
+  // --- Subtítulo (summary truncado), gris, centrado, 1-2 líneas ---
+  const rawSummary = (p.summary || "").trim();
+  if (rawSummary){
+    ctx.font = "500 26px 'Segoe UI', sans-serif";
+    ctx.fillStyle = BRAND.grayText;
+    const subtitleMaxWidth = W - 160;
+    const subtitleLines = computeWrappedLines(ctx, rawSummary, subtitleMaxWidth, 2);
+    ty += 20;
+    subtitleLines.forEach(line => {
+      const lw = ctx.measureText(line).width;
+      ctx.fillText(line, (W - lw) / 2, ty);
+      ty += 34;
+    });
+  }
+
+  // --- Footer: pill redondeado con logo+marca, redes, "medio verificado" ---
+  const footerH = 84;
+  const footerY = H - footerH - 36;
+  const footerX = 36;
+  const footerW = W - 72;
+  ctx.fillStyle = BRAND.bgPanel;
+  roundRect(ctx, footerX, footerY, footerW, footerH, footerH / 2);
+  ctx.fill();
+
+  const footerCenterY = footerY + footerH / 2;
+  ctx.textBaseline = "middle";
+  let fx = footerX + 32;
+
+  try{
+    const logoImg = await loadImageForCanvas(INFOTAKU_LOGO_DATA_URL);
+    const fLogoSize = 32;
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(fx + fLogoSize / 2, footerCenterY, fLogoSize / 2, 0, Math.PI * 2);
+    ctx.closePath();
+    ctx.clip();
+    ctx.drawImage(logoImg, fx, footerCenterY - fLogoSize / 2, fLogoSize, fLogoSize);
+    ctx.restore();
+    fx += fLogoSize + 10;
+  }catch(e){ /* logo decorativo */ }
+
+  ctx.font = "700 22px 'Segoe UI', sans-serif";
+  ctx.fillStyle = BRAND.white;
+  ctx.fillText("INFOTAKU", fx, footerCenterY);
+  fx += ctx.measureText("INFOTAKU").width + 18;
+
+  ctx.font = "600 18px 'Segoe UI', sans-serif";
+  ctx.fillStyle = BRAND.grayText;
+  ctx.fillText("•", fx, footerCenterY);
+  fx += ctx.measureText("•").width + 18;
+
+  ctx.font = "600 18px 'Segoe UI', sans-serif";
+  ctx.fillStyle = BRAND.grayText;
+  ctx.fillText("SÍGUENOS EN", fx, footerCenterY);
+
+  // "MEDIO VERIFICADO ✓" alineado a la derecha del pill.
+  ctx.font = "600 18px 'Segoe UI', sans-serif";
+  const verifiedText = "MEDIO VERIFICADO";
+  const verifiedW = ctx.measureText(verifiedText).width;
+  const checkSize = 20;
+  let vx = footerX + footerW - 28 - checkSize - 8 - verifiedW;
+  ctx.fillStyle = BRAND.grayText;
+  ctx.fillText(verifiedText, vx, footerCenterY);
+  vx += verifiedW + 8;
+  // Check de verificado: círculo violeta con marca blanca, sin depender de
+  // una fuente de emoji (que puede no estar disponible al exportar canvas).
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(vx + checkSize / 2, footerCenterY, checkSize / 2, 0, Math.PI * 2);
+  ctx.fillStyle = BRAND.purpleLight;
+  ctx.fill();
+  ctx.strokeStyle = BRAND.white;
+  ctx.lineWidth = 2.4;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.beginPath();
+  ctx.moveTo(vx + checkSize * 0.28, footerCenterY);
+  ctx.lineTo(vx + checkSize * 0.44, footerCenterY + checkSize * 0.18);
+  ctx.lineTo(vx + checkSize * 0.74, footerCenterY - checkSize * 0.2);
+  ctx.stroke();
+  ctx.restore();
+
+  ctx.textBaseline = "alphabetic";
 
   return canvas.toDataURL("image/png");
 }
+
 
 async function onPublishClick(p){
   const fbBtn = document.getElementById("fb-" + p.id);
@@ -3643,148 +3794,6 @@ function drawYoutubeIcon(ctx, cx, cy, r, color){
   ctx.closePath();
   ctx.fill();
   ctx.restore();
-}
-
-// Genera una tarjeta lista para publicar, con identidad visual propia tipo
-// "cartel de noticias": fondo negro con textura, imagen grande arriba con
-// viñeta fuerte, cápsula de sección en el color de la categoría, titular
-// gigante con contorno (blanco + acento de categoría alternado por línea),
-// y footer con logo, marca y redes sociales dibujadas a mano. Formato
-// vertical 4:5 (1080×1350), estándar para feed de Facebook/Instagram.
-async function onDownloadCardClick(p){
-  if (!p.image) return;
-  try{
-    const [img, logoImg] = await Promise.all([
-      loadImageForCanvas(p.image),
-      loadImageForCanvas(INFOTAKU_LOGO_DATA_URL)
-    ]);
-
-    const canvas = document.createElement("canvas");
-    const W = 1080, H = 1350; // formato vertical 4:5
-    canvas.width = W; canvas.height = H;
-    const ctx = canvas.getContext("2d");
-
-    const cat = CATEGORIES[p.category] || CATEGORIES["anime"];
-    const accent = CATEGORY_ACCENT[p.category] || BRAND.purpleLight;
-    const catLabel = cat.label.toUpperCase();
-
-    // Fondo con textura + viñeta (sustituye al negro plano anterior).
-    drawBackgroundTexture(ctx, W, H, accent);
-
-    // La imagen ocupa el 56% superior de la tarjeta, dejando más espacio
-    // que antes al bloque de texto para un titular grande sin apretarse.
-    const IMG_H = Math.round(H * 0.56);
-    drawImageCover(ctx, img, 0, 0, W, IMG_H);
-
-    // Viñeta fuerte sobre la propia imagen (oscurece bordes y base) para
-    // que el texto y la cápsula de categoría siempre sean legibles sin
-    // importar qué imagen traiga la publicación.
-    const imgVignette = ctx.createLinearGradient(0, 0, 0, IMG_H);
-    imgVignette.addColorStop(0, "rgba(10,10,15,0.35)");
-    imgVignette.addColorStop(0.6, "rgba(10,10,15,0.05)");
-    imgVignette.addColorStop(1, "rgba(10,10,15,0.85)");
-    ctx.fillStyle = imgVignette;
-    ctx.fillRect(0, 0, W, IMG_H);
-
-    // Degradado de fusión hacia el bloque de texto (más alto y más opaco
-    // que antes, para una transición sin costura visible).
-    const fadeGrad = ctx.createLinearGradient(0, IMG_H - 220, 0, IMG_H + 20);
-    fadeGrad.addColorStop(0, "rgba(10,10,15,0)");
-    fadeGrad.addColorStop(1, BRAND.bg);
-    ctx.fillStyle = fadeGrad;
-    ctx.fillRect(0, IMG_H - 220, W, 240);
-
-    // Franja de acento fina que marca la costura imagen/texto (sustituye
-    // al corte diagonal anterior por una línea limpia de color de marca).
-    ctx.fillStyle = accent;
-    ctx.fillRect(0, IMG_H - 6, W, 6);
-
-    // Cápsula de categoría, esquina superior izquierda sobre la imagen,
-    // con icono de rayo y color propio de la categoría.
-    ctx.font = "800 30px 'Segoe UI', sans-serif";
-    const catWidth = ctx.measureText(catLabel).width;
-    ctx.fillStyle = accent;
-    roundRect(ctx, 40, 44, catWidth + 84, 58, 29);
-    ctx.fill();
-    ctx.fillStyle = BRAND.bg;
-    ctx.fillText("⚡ " + catLabel, 62, 82);
-
-    // Eyebrow "NOTICIAS ◆ MARCA", en cápsula sutil sobre fondo negro,
-    // justo encima del titular.
-    const textTop = IMG_H + 56;
-    ctx.font = "700 24px 'Segoe UI', sans-serif";
-    ctx.fillStyle = accent;
-    ctx.fillText("◆ NOTICIAS", 48, textTop);
-    ctx.fillStyle = "rgba(255,255,255,0.55)";
-    ctx.fillText("· INFOTAKU", 48 + ctx.measureText("◆ NOTICIAS ").width, textTop);
-
-    // Titular: tipografía grande con contorno negro para máximo impacto,
-    // alternando blanco y el acento de categoría por línea (como un
-    // cartel de noticias de redes sociales), envuelto automáticamente.
-    const title = (p.headline || p.title).toUpperCase();
-    ctx.font = "900 62px 'Segoe UI', sans-serif";
-    const titleLines = wrapCanvasTextLines(ctx, title, W - 96, 4);
-    const lineHeight = 68;
-    let ty = textTop + 70;
-    titleLines.forEach((line, i) => {
-      const color = (i % 2 === 0) ? BRAND.white : accent;
-      fillTextWithStroke(ctx, line, 48, ty, "rgba(0,0,0,0.55)", 10, color);
-      ty += lineHeight;
-    });
-
-    // Footer: logo circular con anillo de acento + nombre de marca +
-    // "Síguenos en" con iconos de Facebook/YouTube dibujados a mano,
-    // y sello de verificado a la derecha, anclado al fondo de la tarjeta.
-    const footerY = H - 74;
-    const logoSize = 72;
-    const logoCx = 48 + logoSize / 2;
-    const logoCy = footerY - logoSize / 2 + 6;
-
-    // Separador sutil sobre el footer.
-    ctx.fillStyle = "rgba(255,255,255,0.08)";
-    ctx.fillRect(48, footerY - logoSize - 26, W - 96, 1);
-
-    // Anillo de acento detrás del logo.
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(logoCx, logoCy, logoSize / 2 + 5, 0, Math.PI * 2);
-    ctx.strokeStyle = accent;
-    ctx.lineWidth = 3;
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.arc(logoCx, logoCy, logoSize / 2, 0, Math.PI * 2);
-    ctx.closePath();
-    ctx.clip();
-    ctx.drawImage(logoImg, logoCx - logoSize / 2, logoCy - logoSize / 2, logoSize, logoSize);
-    ctx.restore();
-
-    const textX = logoCx + logoSize / 2 + 24;
-    ctx.font = "800 32px 'Segoe UI', sans-serif";
-    ctx.fillStyle = BRAND.white;
-    ctx.fillText("INFOTAKU", textX, footerY - 22);
-    ctx.font = "600 22px 'Segoe UI', sans-serif";
-    ctx.fillStyle = "rgba(255,255,255,0.6)";
-    ctx.fillText("Síguenos en", textX, footerY + 12);
-
-    const followTextWidth = ctx.measureText("Síguenos en").width;
-    const iconR = 16;
-    drawFacebookIcon(ctx, textX + followTextWidth + 30, footerY + 5, iconR, "#ffffff");
-    drawYoutubeIcon(ctx, textX + followTextWidth + 30 + iconR * 2 + 16, footerY + 5, iconR, "#ffffff");
-
-    // Sello "verificado" a la derecha, en el color de acento de categoría.
-    ctx.textAlign = "right";
-    ctx.font = "700 24px 'Segoe UI', sans-serif";
-    ctx.fillStyle = accent;
-    ctx.fillText("✓ MEDIO VERIFICADO", W - 48, footerY - 4);
-    ctx.textAlign = "left";
-
-    canvas.toBlob((blob) => {
-      if (blob) triggerBlobDownload(blob, fileNameFor(p, "tarjeta"));
-    }, "image/png");
-  }catch(e){
-    log(`No se pudo generar la tarjeta de "${p.title}" (${e.message || e}).`, "err");
-    alert("No se pudo generar la tarjeta para descargar, probablemente por restricciones CORS de la imagen de origen. Puedes usar 'Descargar imagen' o abrir la imagen manualmente.");
-  }
 }
 
 function loadImageForCanvas(url){
@@ -4028,7 +4037,15 @@ function stripHtml(html){
 //    de "actualizar" la URL a su variante de mayor tamaño si el patrón es reconocible
 // Si nada alcanza el umbral mínimo de calidad, devuelve "" y la tarjeta mostrará
 // "sin imagen" en vez de arriesgarse a mostrar algo borroso o que no corresponde.
-const MIN_IMAGE_DIMENSION = 500; // px — subido de 300 para exigir mejor calidad todavía
+// Subido de 500 a 1080: el usuario necesita imágenes de verdad en buena
+// resolución para publicaciones (no basta con "no se ve borrosa" — quiere
+// calidad real comparable a wallpaper/fan art de alta resolución). 1080px
+// es el estándar de facto para redes sociales. Este mínimo ahora se pide
+// EN el servidor a los boorus compatibles (ver minWidth en
+// searchDanbooruLike/searchGelbooru) en vez de solo filtrar después — así
+// se aprovecha el volumen real de cada sitio en lugar de descartar la
+// mayoría de una muestra pequeña ya traída.
+const MIN_IMAGE_DIMENSION = 1080; // px
 
 function extractReliableImage(node, rawDescHtml){
   // 1) media:content — se recogen TODAS las variantes y se elige la de mayor ancho
