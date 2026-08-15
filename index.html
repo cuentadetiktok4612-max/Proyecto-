@@ -337,6 +337,11 @@
     padding: 7px 11px;
     font-size: 0.74rem;
   }
+  .btn-cancelable{
+    background: var(--accent-soft, rgba(255,255,255,0.08));
+    border: 1px dashed var(--accent, currentColor);
+    cursor: pointer;
+  }
 
   .row-secondary{
     display: flex;
@@ -2663,6 +2668,7 @@ function cardHtml(p){
         ${p.imageIsFallback ? `<span class="card-fallback-flag">${svgIcon("layers")}Imagen de respaldo</span>` : ""}
         ${p.imageIsAiGenerated ? `<span class="card-fallback-flag">${svgIcon("sparkles")}Ilustración IA</span>` : ""}
         ${p.imageIsAiEdited ? `<span class="card-fallback-flag">${svgIcon("sparkles")}Mejorada con IA</span>` : ""}
+        ${p.imageIsLocalEdit ? `<span class="card-fallback-flag">${svgIcon("layers")}Editada en el navegador</span>` : ""}
       </div>
       <div class="card-body">
         <div class="card-source-row">
@@ -2697,42 +2703,107 @@ function cardHtml(p){
 // fuente (p.image original) — y SOLO en ese caso específico, nunca ante
 // otro tipo de error (cuota agotada, timeout, etc.), que se muestra tal
 // cual para no confundir "no se pudo generar ahora" con "está bloqueado".
+async function requestAiImage(p, signal){
+  const res = await fetch("/.netlify/functions/generate-image", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      title: p.title,
+      category: p.category,
+      postType: p.postType,
+      summary: p.summary,
+      // Se envía SIEMPRE la imagen oficial original (no la ya editada,
+      // por si el usuario genera dos veces seguidas), para que la
+      // función la use como base de edición en vez de generar desde
+      // cero. Si no hay imagen original, la función genera desde texto.
+      sourceImageUrl: p.originalImage || null
+    }),
+    signal
+  });
+  const json = await res.json().catch(() => null);
+  if (!res.ok || !json){
+    const err = new Error((json && json.error) || `HTTP ${res.status}`);
+    err.capacityError = !!(json && json.capacityError);
+    throw err;
+  }
+  return json;
+}
+
+// Reintentos pacientes ante "capacityError" (Cloudflare sin datacenter GPU
+// disponible en ese instante: error 3040, transitorio, no es problema de
+// cuota ni de cuenta). El usuario prefiere esperar varios minutos antes que
+// ver un error, así que se reintenta con backoff creciente hasta este tope,
+// y solo se detiene si el usuario cancela o si el error deja de ser de
+// capacidad (ahí sí es un fallo real: falta configurar credenciales, imagen
+// fuente inválida, etc., y no tiene sentido seguir reintentando eso).
+const AI_IMAGE_RETRY_DELAYS_MS = [3000, 5000, 8000, 12000, 20000, 30000, 30000, 30000, 30000, 30000];
+const AI_IMAGE_MAX_WAIT_MS = AI_IMAGE_RETRY_DELAYS_MS.reduce((a, b) => a + b, 0); // ~3 min
+
+// Controllers activos por publicación, para poder cancelar desde el botón.
+const aiImageCancelers = {};
+
+function formatWaitLabel(msElapsed){
+  const totalSec = Math.round(msElapsed / 1000);
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return m > 0 ? `${m}m ${s}s` : `${s}s`;
+}
+
 async function onGenerateAiImageClick(p){
   const btn = document.getElementById("aiimg-" + p.id);
-  if (btn){ btn.disabled = true; btn.textContent = "Mejorando imagen…"; }
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10000);
+  // Si ya hay una generación en curso para esta tarjeta, el clic cancela.
+  if (aiImageCancelers[p.id]){
+    aiImageCancelers[p.id].cancelled = true;
+    if (aiImageCancelers[p.id].controller) aiImageCancelers[p.id].controller.abort();
+    return;
+  }
+
+  const state = { cancelled: false, controller: null };
+  aiImageCancelers[p.id] = state;
+  if (btn){ btn.disabled = false; btn.textContent = "Generando… (toca para cancelar)"; btn.classList.add("btn-cancelable"); }
+
+  const startedAt = Date.now();
+  let json = null;
+  let lastError = null;
 
   try{
-    const res = await fetch("/.netlify/functions/generate-image", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        title: p.title,
-        category: p.category,
-        postType: p.postType,
-        summary: p.summary,
-        // Se envía SIEMPRE la imagen oficial original (no la ya editada,
-        // por si el usuario genera dos veces seguidas), para que la
-        // función la use como base de edición en vez de generar desde
-        // cero. Si no hay imagen original, la función genera desde texto.
-        sourceImageUrl: p.originalImage || null
-      }),
-      signal: controller.signal
-    });
-    const json = await res.json().catch(() => null);
+    for (let attempt = 0; attempt <= AI_IMAGE_RETRY_DELAYS_MS.length; attempt++){
+      if (state.cancelled) { lastError = new Error("cancelado por el usuario"); break; }
 
-    if (!res.ok || !json){
-      throw new Error((json && json.error) || `HTTP ${res.status}`);
+      const controller = new AbortController();
+      state.controller = controller;
+      const timeout = setTimeout(() => controller.abort(), 10000);
+      try{
+        json = await requestAiImage(p, controller.signal);
+        lastError = null;
+        break;
+      }catch(e){
+        lastError = e;
+        const isTimeoutAbort = e.name === "AbortError" && !state.cancelled;
+        const shouldRetry = (e.capacityError || isTimeoutAbort) && attempt < AI_IMAGE_RETRY_DELAYS_MS.length;
+        if (!shouldRetry) break;
+        const elapsed = formatWaitLabel(Date.now() - startedAt);
+        if (btn) btn.textContent = `Servidores ocupados, reintentando (${elapsed}, toca para cancelar)…`;
+        await new Promise(r => setTimeout(r, AI_IMAGE_RETRY_DELAYS_MS[attempt]));
+      }finally{
+        clearTimeout(timeout);
+      }
     }
+
+    if (state.cancelled){
+      log(`Generación de imagen cancelada para "${p.title}".`, "warn");
+      if (btn){ btn.textContent = "✨ Mejorar con IA"; btn.classList.remove("btn-cancelable"); }
+      return;
+    }
+    if (lastError) throw lastError;
 
     if (json.blocked){
       // Señal explícita de bloqueo por copyright/seguridad: se conserva la
       // imagen real original (p.image ya la tiene) y se avisa por qué no
       // se reemplazó, en vez de fallar en silencio.
       log(`Ilustración IA bloqueada para "${p.title}" (motivo: ${json.reason || "copyright/seguridad"}). Se conserva la imagen original de la fuente.`, "warn");
-      if (btn){ btn.disabled = false; btn.textContent = "🔒 Bloqueada por copyright — usando imagen real"; }
+      if (btn){ btn.textContent = "🔒 Bloqueada por copyright — usando imagen real"; btn.classList.remove("btn-cancelable"); }
       setTimeout(() => { if (btn) btn.textContent = "✨ Mejorar con IA"; }, 3500);
       return;
     }
@@ -2750,14 +2821,44 @@ async function onGenerateAiImageClick(p){
     saveToStorage();
     renderFeed();
     log(json.usedSourceImage
-      ? `Imagen oficial mejorada con IA para "${p.title}".`
-      : `Ilustración IA generada desde cero para "${p.title}" (no había imagen oficial disponible).`, "ok");
+      ? `Imagen oficial mejorada con IA para "${p.title}" (tras ${formatWaitLabel(Date.now() - startedAt)}).`
+      : `Ilustración IA generada desde cero para "${p.title}" (no había imagen oficial disponible; tras ${formatWaitLabel(Date.now() - startedAt)}).`, "ok");
   }catch(e){
-    const message = e.name === "AbortError" ? "tiempo de espera agotado" : (e.message || e);
+    const message = e.capacityError
+      ? `servidores de IA sin capacidad durante ${formatWaitLabel(AI_IMAGE_MAX_WAIT_MS)} seguidos`
+      : (e.message || e);
+
+    // Si el fallo fue por capacidad (no un error de configuración real) y
+    // hay alguna imagen base (original o la que ya tenía la publicación),
+    // se compone automáticamente una versión "mejorada" con Canvas del
+    // propio navegador — sin IA, sin servidor, gratis e instantáneo — en
+    // vez de dejar la publicación sin portada tras varios minutos de espera.
+    if (e.capacityError && (p.originalImage || p.image)){
+      try{
+        if (btn) btn.textContent = "IA no disponible, editando localmente…";
+        const localDataUrl = await composeLocalFallbackImage(p);
+        if (localDataUrl){
+          p.image = localDataUrl;
+          p.imageIsFallback = false;
+          p.imageIsAiGenerated = false;
+          p.imageIsAiEdited = false;
+          p.imageIsLocalEdit = true;
+          saveToStorage();
+          renderFeed();
+          log(`No se pudo procesar la imagen con IA para "${p.title}" (${message}). Se editó automáticamente en el navegador (sin IA) como respaldo.`, "warn");
+          return;
+        }
+      }catch(localErr){
+        log(`No se pudo procesar la imagen con IA para "${p.title}" (${message}), y tampoco se pudo editar localmente (${localErr.message || localErr}).`, "err");
+        if (btn){ btn.disabled = false; btn.textContent = "✨ Mejorar con IA"; btn.classList.remove("btn-cancelable"); }
+        return;
+      }
+    }
+
     log(`No se pudo procesar la imagen con IA para "${p.title}" (${message}).`, "err");
-    if (btn){ btn.disabled = false; btn.textContent = "✨ Mejorar con IA"; }
+    if (btn){ btn.disabled = false; btn.textContent = "✨ Mejorar con IA"; btn.classList.remove("btn-cancelable"); }
   }finally{
-    clearTimeout(timeout);
+    delete aiImageCancelers[p.id];
   }
 }
 
@@ -2773,6 +2874,84 @@ const BRAND = {
   white: "#FFFFFF"
 };
 
+
+// Fallback SIN IA, 100% en el navegador: cuando la generación/edición con
+// Cloudflare falla definitivamente (tras todos los reintentos pacientes),
+// se compone automáticamente una versión "mejorada" de la imagen original
+// usando Canvas 2D — el mismo recurso nativo que ya usa la tarjeta
+// descargable (drawImageCover, degradado, título, logo) — en vez de dejar
+// la publicación sin ninguna imagen. No sustituye a la IA (no genera arte
+// nuevo desde texto si no hay imagen original), pero garantiza que la
+// portada exista y tenga la identidad visual de Infotaku.
+// Devuelve un dataURL PNG, o null si no hay ninguna imagen base disponible.
+async function composeLocalFallbackImage(p){
+  const baseUrl = p.originalImage || p.image;
+  if (!baseUrl) return null;
+
+  const img = await loadImageForCanvas(baseUrl);
+
+  const canvas = document.createElement("canvas");
+  const W = 864, H = 1080; // mismo formato vertical que usa la IA (generate-image.js)
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext("2d");
+
+  // "Mejora" vía filtro nativo de Canvas (sin IA): sube ligeramente
+  // contraste, saturación y nitidez percibida antes de dibujar la imagen
+  // base, cubriendo el lienzo completo.
+  ctx.filter = "contrast(1.08) saturate(1.15) brightness(1.03)";
+  drawImageCover(ctx, img, 0, 0, W, H);
+  ctx.filter = "none";
+
+  // Degradado inferior para que el título sea legible sobre la imagen,
+  // igual que en la tarjeta descargable.
+  const gradH = Math.round(H * 0.42);
+  const grad = ctx.createLinearGradient(0, H - gradH, 0, H);
+  grad.addColorStop(0, "rgba(10,10,15,0)");
+  grad.addColorStop(1, "rgba(10,10,15,0.92)");
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, H - gradH, W, gradH);
+
+  // Etiqueta de categoría, sticker diagonal (idéntico estilo a la tarjeta).
+  const cat = CATEGORIES[p.category] || CATEGORIES["anime"];
+  const catLabel = cat.label.toUpperCase();
+  ctx.save();
+  ctx.rotate(-8 * Math.PI / 180);
+  ctx.font = "800 26px 'Segoe UI', sans-serif";
+  const catWidth = ctx.measureText(catLabel).width;
+  ctx.fillStyle = BRAND.purple;
+  roundRect(ctx, -16, 36, catWidth + 60, 48, 9);
+  ctx.fill();
+  ctx.fillStyle = BRAND.white;
+  ctx.fillText(catLabel, 28, 68);
+  ctx.restore();
+
+  // Título superpuesto, anclado al pie, envuelto en varias líneas.
+  const title = (p.headline || p.title).toUpperCase();
+  ctx.font = "900 46px 'Segoe UI', sans-serif";
+  ctx.fillStyle = BRAND.white;
+  const titleLines = wrapCanvasTextLines(ctx, title, W - 72, 4);
+  let ty = H - 48 - (titleLines.length - 1) * 52;
+  titleLines.forEach((line, i) => {
+    ctx.fillStyle = i === 0 ? BRAND.purpleLight : BRAND.white;
+    ctx.fillText(line, 36, ty);
+    ty += 52;
+  });
+
+  // Logo pequeño en la esquina, como sello de marca.
+  try{
+    const logoImg = await loadImageForCanvas(INFOTAKU_LOGO_DATA_URL);
+    const logoSize = 44;
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(W - 36 - logoSize / 2, 36 + logoSize / 2, logoSize / 2, 0, Math.PI * 2);
+    ctx.closePath();
+    ctx.clip();
+    ctx.drawImage(logoImg, W - 36 - logoSize, 36, logoSize, logoSize);
+    ctx.restore();
+  }catch(e){ /* el logo es decorativo; si falla, se omite sin interrumpir */ }
+
+  return canvas.toDataURL("image/png");
+}
 
 async function onPublishClick(p){
   const fbBtn = document.getElementById("fb-" + p.id);
