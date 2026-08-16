@@ -84,7 +84,15 @@ async function queryIgdb(mode, clientId, token) {
   const in60days = nowSec + 60 * 24 * 60 * 60;
   const ago90 = nowSec - 90 * 24 * 60 * 60;
 
-  const fields = "name,first_release_date,rating,aggregated_rating,platforms.name,genres.name,summary,cover.url";
+  // Se pide "screenshots.url" además de "cover.url": el cover de IGDB
+  // (t_cover_big) mide solo 227x320px, muy por debajo del mínimo de 1080px
+  // que exige el filtro de calidad del frontend (MIN_IMAGE_DIMENSION en
+  // index.html) — así que TODA publicación basada en IGDB terminaba cayendo
+  // siempre a la imagen de respaldo genérica, sin importar qué tan bueno
+  // fuera el juego encontrado. Los screenshots de IGDB sí llegan a 1920x1080
+  // reales (t_1080p), y son la imagen correcta para una publicación de
+  // videojuegos de todos modos (una captura del juego, no solo la carátula).
+  const fields = "name,first_release_date,rating,aggregated_rating,platforms.name,genres.name,summary,cover.url,screenshots.url";
 
   let body;
   if (mode === "upcoming") {
@@ -130,11 +138,20 @@ async function queryIgdb(mode, clientId, token) {
     const released = g.first_release_date
       ? new Date(g.first_release_date * 1000).toISOString().slice(0, 10)
       : null;
-    // IGDB devuelve URLs de cover en formato "//images.igdb.com/.../t_thumb/...";
-    // se fuerza https y se pide el tamaño grande en vez del thumbnail.
+
+    // Prioridad: screenshot grande (t_1080p, 1920x1080 reales) > cover
+    // grande (t_cover_big, 227x320 — se mantiene solo como último recurso,
+    // ya que el frontend igual la va a descartar por tamaño casi siempre,
+    // pero es mejor que no tener ninguna imagen).
     let image = "";
-    if (g.cover && g.cover.url) {
-      image = g.cover.url.replace(/^\/\//, "https://").replace("t_thumb", "t_cover_big");
+    if (g.screenshots && g.screenshots.length) {
+      const shot = g.screenshots[0];
+      if (shot && shot.url) {
+        image = shot.url.replace(/^\/\//, "https://").replace(/t_[a-z0-9_]+/, "t_1080p");
+      }
+    }
+    if (!image && g.cover && g.cover.url) {
+      image = g.cover.url.replace(/^\/\//, "https://").replace(/t_[a-z0-9_]+/, "t_cover_big");
     }
 
     return {
