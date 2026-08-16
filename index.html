@@ -2941,6 +2941,21 @@ async function selectBestImageForItem(item){
         log(`Imagen "${item.title.slice(0,40)}…": reintento con query relajado encontró ${pool.length} candidatas.`, pool.length ? "ok" : "warn");
       }
       if (pool.length === 0){
+        // Último recurso antes del respaldo genérico: si la fuente original
+        // (RSS/IGDB/MAL/AniList) ya traía una imagen propia (item.image),
+        // se usa directo aunque no haya pasado los filtros — es la imagen
+        // oficial de ESA noticia/juego/anime específico, así que por
+        // definición tiene relación con el tema, a diferencia del respaldo
+        // genérico por categoría (que no la tiene con ninguna publicación
+        // en particular).
+        if (item.image){
+          log(`Imagen "${item.title.slice(0,40)}…": ninguna candidata de búsqueda pasó los filtros, pero se usa la imagen original de la fuente en vez del respaldo genérico.`, "warn");
+          return {
+            url: item.image,
+            isFallback: false,
+            sourceLabel: item.source || "Fuente original"
+          };
+        }
         const fallbackUrl = FALLBACK_IMAGE_BY_CAT[item.category] || FALLBACK_IMAGE_BY_CAT["anime"];
         log(`Imagen "${item.title.slice(0,40)}…": ninguna candidata pasó los filtros ni con query relajado, usando respaldo por categoría.`, "warn");
         return { url: fallbackUrl, isFallback: true, sourceLabel: "Respaldo genérico" };
@@ -2976,6 +2991,27 @@ async function selectBestImageForItem(item){
     }
 
     if (!verifiedCandidate){
+      // Antes de rendirse al respaldo genérico (que no tiene NINGUNA
+      // relación con el tema de la publicación), se intenta un último
+      // recurso: usar la candidata mejor puntuada del pool SIN haber
+      // podido verificar su resolución real (measureImageDimensions
+      // puede fallar por CORS/hotlink aunque la imagen exista y sea
+      // perfectamente válida — eso no es lo mismo que "no hay imagen del
+      // tema"). Solo se hace esto si la candidata tiene relevancia real
+      // (no el piso de 0.3 que cualquier candidata recibe por el simple
+      // hecho de venir de una búsqueda por tema) y viene de la fuente
+      // original del artículo/ficha (RSS/IGDB/MAL/AniList) o superó
+      // claramente el umbral de coincidencia de palabras — así se evita
+      // usar "sin verificar" algo que en realidad tampoco es del tema.
+      const bestUnverified = ranked.find(c => (c._debugScores?.relevance || 0) >= 0.6);
+      if (bestUnverified){
+        log(`Imagen "${item.title.slice(0,40)}…": no se pudo verificar la resolución de ninguna candidata (posible bloqueo CORS/hotlink), pero se usa la mejor relacionada con el tema (${bestUnverified.sourceLabel}) en vez del respaldo genérico.`, "warn");
+        return {
+          url: upgradeImageUrl(bestUnverified.url) || bestUnverified.url,
+          isFallback: false,
+          sourceLabel: bestUnverified.sourceLabel || "Búsqueda multifuente (sin verificar)"
+        };
+      }
       const fallbackUrl = FALLBACK_IMAGE_BY_CAT[item.category] || FALLBACK_IMAGE_BY_CAT["anime"];
       log(`Imagen "${item.title.slice(0,40)}…": ninguna candidata superó la verificación real de resolución, usando respaldo por categoría.`, "warn");
       return { url: fallbackUrl, isFallback: true, sourceLabel: "Respaldo genérico" };
@@ -3681,24 +3717,33 @@ async function composeLocalFallbackImage(p){
   }catch(e){ /* si el canvas quedó "tainted" por CORS, se sigue sin este realce */ }
   ctx.restore();
 
-  // Degradado amplio que se dibuja POR ENCIMA de la imagen (no debajo):
-  // arranca bien adentro de la imagen, ya visiblemente oscureciéndola antes
-  // del borde inferior (no solo transparente ahí), y termina opaco bien
-  // pasado ese borde. Con solo dos paradas de color (0 y 1) la opacidad en
-  // el propio borde de la imagen (y=imgH) resultaba todavía muy baja, así
-  // que el corte real (imagen a color contra el negro sólido del panel de
-  // abajo) se seguía viendo como un borde recto en vez de un fundido. Las
-  // paradas intermedias fuerzan que, para cuando se llega a imgH, la
-  // opacidad ya sea alta y el contraste con el negro de abajo casi
-  // desaparezca.
-  const fadeStart = Math.round(imgH * 0.42);
-  const fadeEnd = Math.round(imgH * 1.18);
+  // Degradado amplio que se dibuja POR ENCIMA de la imagen (no debajo).
+  // Medido contra una publicación de referencia (otra página, difuminado
+  // que el usuario confirmó que se ve bien): ahí la transición completa
+  // dura aproximadamente el 25% de la altura TOTAL del canvas, con una
+  // curva casi lineal (nunca sube de golpe al principio ni se estanca).
+  //
+  // PUNTO CRÍTICO (la causa real de los cortes vistos en varias iteraciones
+  // anteriores): imgH es el borde exacto donde el clip() deja de dibujar la
+  // imagen — a partir de ahí NO hay más imagen, solo lo que pinte este
+  // degradado. Si fadeOpaqueAt (donde la opacidad llega a 1.0) queda
+  // DESPUÉS de imgH, entonces justo en imgH la opacidad todavía es parcial
+  // y la imagen original (con su brillo/detalle real) se ve "a través" del
+  // negro parcial — eso es el salto, porque inmediatamente después (fuera
+  // del clip) ya no hay imagen, solo negro subiendo. La solución no es solo
+  // "alargar la curva": es garantizar que fadeOpaqueAt SIEMPRE caiga en o
+  // antes de imgH, sin importar cuánto se alargue fadeStart hacia atrás.
+  const fadeOpaqueAt = imgH; // opacidad 100% justo EN el borde del clip, nunca después
+  const fadeStart = Math.round(imgH - H * 0.25); // recorrido largo hacia atrás (~25% de H, como la referencia)
+  const fadeEnd = Math.round(imgH + H * 0.05); // pequeño margen extra ya en negro sólido, por si drawImageCover desborda
   const fade = ctx.createLinearGradient(0, fadeStart, 0, fadeEnd);
   const fadeRgb = "6,0,10";
+  const opaqueStop = Math.max(0, Math.min(1, (fadeOpaqueAt - fadeStart) / (fadeEnd - fadeStart)));
   fade.addColorStop(0, `rgba(${fadeRgb},0)`);
-  fade.addColorStop(0.35, `rgba(${fadeRgb},0.28)`);
-  fade.addColorStop(0.55, `rgba(${fadeRgb},0.58)`);
-  fade.addColorStop(0.72, `rgba(${fadeRgb},0.86)`);
+  fade.addColorStop(opaqueStop * 0.35, `rgba(${fadeRgb},0.35)`);
+  fade.addColorStop(opaqueStop * 0.65, `rgba(${fadeRgb},0.7)`);
+  fade.addColorStop(opaqueStop * 0.88, `rgba(${fadeRgb},0.94)`);
+  fade.addColorStop(opaqueStop, BRAND.bgDeep);
   fade.addColorStop(1, BRAND.bgDeep);
   ctx.fillStyle = fade;
   ctx.fillRect(0, fadeStart, W, fadeEnd - fadeStart);
@@ -4320,15 +4365,20 @@ function stripHtml(html){
 //    de "actualizar" la URL a su variante de mayor tamaño si el patrón es reconocible
 // Si nada alcanza el umbral mínimo de calidad, devuelve "" y la tarjeta mostrará
 // "sin imagen" en vez de arriesgarse a mostrar algo borroso o que no corresponde.
-// Subido de 500 a 1080: el usuario necesita imágenes de verdad en buena
-// resolución para publicaciones (no basta con "no se ve borrosa" — quiere
-// calidad real comparable a wallpaper/fan art de alta resolución). 1080px
-// es el estándar de facto para redes sociales. Este mínimo ahora se pide
-// EN el servidor a los boorus compatibles (ver minWidth en
-// searchDanbooruLike/searchGelbooru) en vez de solo filtrar después — así
-// se aprovecha el volumen real de cada sitio en lugar de descartar la
-// mayoría de una muestra pequeña ya traída.
-const MIN_IMAGE_DIMENSION = 1080; // px
+// Bajado de 1080 a 480: Facebook no exige ningún tamaño mínimo real, así que
+// exigir 1080px aquí era una regla propia sin base en ningún requisito
+// externo — y tenía un efecto secundario grave: cuando la ÚNICA candidata
+// relacionada con el tema medía, digamos, 900px, este filtro la descartaba
+// igual que a un ícono de 16px, y el sistema caía al respaldo genérico (una
+// imagen sin ninguna relación con el tema de la publicación) en vez de usar
+// la imagen correcta aunque no fuera enorme. 480px sigue descartando iconos,
+// avatares y miniaturas reales, pero ya no descarta fotos/arte normales
+// solo por no ser "de wallpaper". La relevancia al tema (queryWords/score)
+// sigue siendo el criterio que de verdad decide qué candidata se usa —ver
+// IMAGE_SCORE_WEIGHTS, que ya pesa relevancia (0.5) más que resolución
+// (0.3)—; este mínimo es solo un piso para descartar basura, no un filtro
+// de "calidad" por sí mismo.
+const MIN_IMAGE_DIMENSION = 480; // px
 
 function extractReliableImage(node, rawDescHtml){
   // 1) media:content — se recogen TODAS las variantes y se elige la de mayor ancho
