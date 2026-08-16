@@ -1014,10 +1014,19 @@ const fbPageChooseBtn = $("fbPageChooseBtn");
    INIT
    ========================================================= */
 function init(){
-  loadFromStorage();
+  // loadFromStorage ahora es asíncrona (IndexedDB), pero init() en sí no
+  // necesita ser async: se dispara la carga y, en cuanto resuelve, se
+  // pinta el feed. Los listeners de botones se registran de inmediato
+  // (no dependen de tener posts cargados), así la UI responde al toque
+  // aunque la carga tarde un instante.
+  loadFromStorage().then(() => {
+    renderFeed();
+  }).catch((e) => {
+    log(`No se pudieron cargar las publicaciones guardadas (${e.message || e}).`, "err");
+    renderFeed();
+  });
   loadFbCreds();
   buildFilterChips();
-  renderFeed();
   renderSchedulePanel();
   generateBtn.addEventListener("click", onGenerateClick);
   clearBtn.addEventListener("click", onClearClick);
@@ -1034,13 +1043,115 @@ function init(){
 }
 
 /* =========================================================
-   STORAGE
+   STORAGE — POSTS EN INDEXEDDB, EL RESTO EN LOCALSTORAGE
+   =========================================================
+   Los posts (que incluyen imágenes en base64, a veces de varios cientos de
+   KB cada una) se guardaban antes en localStorage, con solo ~5-10MB de
+   cupo total por sitio. Con dos o tres publicaciones con imagen propia o
+   "mejorada" ya se llenaba, y a partir de ahí localStorage.setItem lanzaba
+   una excepción ("exceeded the quota") que no se capturaba en ningún lado
+   — por eso "Mejorar imagen" fallaba en cadena para publicaciones que ya
+   ni siquiera eran las que se estaban editando en ese momento.
+   IndexedDB no tiene ese límite tan bajo (cientos de MB típicamente, según
+   espacio libre en disco), así que los posts viven ahí. seenIds, las
+   credenciales de Facebook y el historial de publicaciones siguen en
+   localStorage porque son livianos (no llevan imágenes) y no hace falta
+   la complejidad extra de IndexedDB para ellos.
    ========================================================= */
-function loadFromStorage(){
+const IDB_NAME = "infotaku_db";
+const IDB_VERSION = 1;
+const IDB_STORE_POSTS = "posts";
+
+let _idbPromise = null;
+
+function openInfotakuDB(){
+  if (_idbPromise) return _idbPromise;
+  _idbPromise = new Promise((resolve, reject) => {
+    if (!window.indexedDB){
+      reject(new Error("Este navegador no soporta IndexedDB."));
+      return;
+    }
+    const req = indexedDB.open(IDB_NAME, IDB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(IDB_STORE_POSTS)){
+        db.createObjectStore(IDB_STORE_POSTS, { keyPath: "id" });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error("No se pudo abrir la base de datos local (IndexedDB)."));
+  });
+  return _idbPromise;
+}
+
+// Reemplaza el contenido completo del store de posts por el array dado.
+// Se usa una única transacción: o se guardan todos, o ninguno, para que
+// nunca quede el store a medias si algo falla a mitad de camino.
+async function idbReplaceAllPosts(posts){
+  const db = await openInfotakuDB();
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE_POSTS, "readwrite");
+    const store = tx.objectStore(IDB_STORE_POSTS);
+    store.clear();
+    for (const p of posts) store.put(p);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error("Fallo al guardar en IndexedDB."));
+    tx.onabort = () => reject(tx.error || new Error("Guardado en IndexedDB cancelado."));
+  });
+}
+
+async function idbLoadAllPosts(){
+  const db = await openInfotakuDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE_POSTS, "readonly");
+    const store = tx.objectStore(IDB_STORE_POSTS);
+    const req = store.getAll();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error || new Error("Fallo al leer publicaciones guardadas."));
+  });
+}
+
+// Migra publicaciones que hayan quedado guardadas en localStorage por una
+// versión anterior de la app. Se ejecuta una sola vez: si tiene éxito,
+// borra la clave vieja de localStorage para liberar ese cupo tan
+// limitado. Si el localStorage ya estaba lleno y ni siquiera se puede leer
+// con normalidad, igual se intenta — leer no consume cupo, solo escribir.
+async function migrateLegacyLocalStoragePosts(){
+  let legacyRaw = null;
   try{
-    const rawPosts = localStorage.getItem(STORAGE_KEY_POSTS);
-    allPosts = rawPosts ? JSON.parse(rawPosts) : [];
-  }catch(e){ allPosts = []; }
+    legacyRaw = localStorage.getItem(STORAGE_KEY_POSTS);
+  }catch(e){ /* ignorar: nada que migrar */ }
+  if (!legacyRaw) return;
+
+  try{
+    const legacyPosts = JSON.parse(legacyRaw);
+    if (Array.isArray(legacyPosts) && legacyPosts.length){
+      const existing = await idbLoadAllPosts();
+      if (!existing.length){
+        await idbReplaceAllPosts(legacyPosts);
+        log(`Se migraron ${legacyPosts.length} publicaciones guardadas al nuevo almacenamiento (IndexedDB).`, "ok");
+      }
+    }
+    // Se limpia la clave vieja tanto si se migró como si ya no hacía falta
+    // (por ejemplo si IndexedDB ya tenía datos), para liberar cupo de
+    // localStorage de una vez por todas.
+    localStorage.removeItem(STORAGE_KEY_POSTS);
+  }catch(e){
+    log(`No se pudieron migrar publicaciones antiguas (${e.message || e}). Se conservan por si acaso.`, "warn");
+  }
+}
+
+async function loadFromStorage(){
+  try{
+    await migrateLegacyLocalStoragePosts();
+  }catch(e){ /* migración es best-effort, no debe bloquear el arranque */ }
+
+  try{
+    allPosts = await idbLoadAllPosts();
+  }catch(e){
+    allPosts = [];
+    log(`No se pudieron cargar las publicaciones guardadas (${e.message || e}).`, "err");
+  }
 
   try{
     const rawSeen = localStorage.getItem(STORAGE_KEY_SEEN);
@@ -1049,9 +1160,27 @@ function loadFromStorage(){
   }catch(e){ seenIds = new Set(); }
 }
 
-function saveToStorage(){
-  localStorage.setItem(STORAGE_KEY_POSTS, JSON.stringify(allPosts));
-  localStorage.setItem(STORAGE_KEY_SEEN, JSON.stringify(Array.from(seenIds)));
+// Devuelve true/false según si logró guardar. Antes esto lanzaba una
+// excepción sin capturar en cuanto localStorage se llenaba, y esa
+// excepción interrumpía silenciosamente cualquier función que llamara a
+// saveToStorage() a mitad de camino (por eso "Mejorar imagen" fallaba).
+// Ahora se captura el error, se avisa con un mensaje claro en el log, y
+// quien llame a saveToStorage() puede decidir qué hacer si devuelve false.
+async function saveToStorage(){
+  let ok = true;
+  try{
+    await idbReplaceAllPosts(allPosts);
+  }catch(e){
+    ok = false;
+    log(`No se pudieron guardar las publicaciones (${e.message || e}). Los cambios de esta sesión podrían perderse al recargar.`, "err");
+  }
+  try{
+    localStorage.setItem(STORAGE_KEY_SEEN, JSON.stringify(Array.from(seenIds)));
+  }catch(e){
+    // No crítico: seenIds solo evita duplicados al buscar novedades: si
+    // falla, en el peor caso se repite alguna publicación ya vista.
+  }
+  return ok;
 }
 
 /* =========================================================
@@ -1602,14 +1731,20 @@ async function onGenerateClick(){
   candidates = candidates.concat(await safeFetchGroup("Debates de la comunidad", () => fetchDebateTopics()));
 
   // --- 4) RSS: videojuegos y noticias generales (vía proxy) ---
-  for (const feed of RSS_FEEDS){
-    candidates = candidates.concat(await safeFetchGroup(feed.name, () => fetchRssFeed(feed)));
-  }
+  // Se piden en PARALELO (Promise.all) en vez de una por una: antes, con 13
+  // feeds en serie y hasta 8-24s de espera cada uno si fallaba, una sola
+  // ronda de generación podía tardar varios minutos. En paralelo, el tiempo
+  // total es el de la fuente más lenta, no la suma de las 13.
+  const rssResults = await Promise.all(
+    RSS_FEEDS.map(feed => safeFetchGroup(feed.name, () => fetchRssFeed(feed)))
+  );
+  rssResults.forEach(items => { candidates = candidates.concat(items); });
 
   // --- 5) Reddit: comunidades reales de fans (hilos del día, vía proxy) ---
-  for (const feed of REDDIT_FEEDS){
-    candidates = candidates.concat(await safeFetchGroup(feed.name, () => fetchRedditFeed(feed)));
-  }
+  const redditResults = await Promise.all(
+    REDDIT_FEEDS.map(feed => safeFetchGroup(feed.name, () => fetchRedditFeed(feed)))
+  );
+  redditResults.forEach(items => { candidates = candidates.concat(items); });
 
   // quitar ya vistas y sin datos mínimos
   candidates = candidates.filter(c => c.title && c.link && !seenIds.has(c.uid));
@@ -1682,7 +1817,7 @@ async function onGenerateClick(){
     // Se inserta ordenado por más reciente (igual que antes), y se
     // repinta el feed completo para reflejar la nueva llegada al instante.
     allPosts = [post, ...allPosts];
-    saveToStorage();
+    await saveToStorage();
     renderFeed();
 
     doneCount++;
@@ -1710,10 +1845,10 @@ async function safeFetchGroup(label, fn){
   }
 }
 
-function onClearClick(){
+async function onClearClick(){
   if (!confirm("¿Vaciar todas las publicaciones guardadas? Esto no borra el historial anti-duplicados.")) return;
   allPosts = [];
-  saveToStorage();
+  await saveToStorage();
   renderFeed();
   setStatus("Publicaciones guardadas vaciadas", "ok");
 }
@@ -2115,20 +2250,38 @@ async function fetchRawgRandom(){
   }];
 }
 
-// Intenta traer una URL a través de la lista de proxies CORS en orden,
-// pasando al siguiente si el actual falla (HTTP no-ok, timeout o error de
-// red). Solo lanza error si TODOS los proxies fallan, para que una fuente
-// individual no se pierda solo porque el proxy principal tuvo un mal momento.
+// Intenta traer una URL, primero a través de la función propia de Netlify
+// (rss-proxy.js — corre en el servidor de Netlify, con salida a internet
+// normal, sin depender de terceros) y, si esa no está disponible o falla,
+// cae a la lista de proxies CORS públicos como respaldo (por ejemplo si el
+// HTML se abre directamente sin pasar por Netlify, en desarrollo local).
+// Solo lanza error si TODO falló, para que una fuente individual no se
+// pierda solo porque un intento tuvo un mal momento.
 async function fetchWithCorsProxy(targetUrl){
   let lastError;
+
+  try{
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 9000);
+    const res = await fetch(`/.netlify/functions/rss-proxy?url=${encodeURIComponent(targetUrl)}`, {
+      cache: "no-store",
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+    if (res.ok) return await res.text();
+    lastError = new Error("HTTP " + res.status);
+  }catch(e){
+    lastError = e.name === "AbortError" ? new Error("Tiempo de espera agotado") : e;
+  }
+
   for (const proxy of CORS_PROXIES){
     try{
       const controller = new AbortController();
       // Bajado de 12s a 8s por proxy: con 3 proxies en cascada (se agregó
       // CodeTabs como tercer respaldo), 12s cada uno podía sumar hasta 36s
-      // de espera por UNA fuente si las tres fallaban, y esto corre
-      // secuencialmente para ~19 fuentes RSS/Reddit en total. 8s sigue
-      // siendo tiempo de sobra para una respuesta de texto/RSS normal.
+      // de espera por UNA fuente si las tres fallaban. Esto ahora es solo
+      // el respaldo (la función propia de Netlify es el primer intento),
+      // así que 8s sigue siendo tiempo de sobra.
       const timeout = setTimeout(() => controller.abort(), 8000);
       const res = await fetch(proxy + encodeURIComponent(targetUrl), {
         cache: "no-store",
@@ -3339,9 +3492,13 @@ async function onEnhanceImageClick(p){
     p.imageIsFallback = false;
     p.imageIsCustom = false;
     p.imageIsLocalEdit = true;
-    saveToStorage();
+    const saved = await saveToStorage();
     renderFeed();
-    log(`Imagen mejorada (nitidez, color y marca) para "${p.title}".`, "ok");
+    if (saved){
+      log(`Imagen mejorada (nitidez, color y marca) para "${p.title}".`, "ok");
+    } else {
+      log(`Imagen mejorada para "${p.title}", pero no se pudo guardar en el almacenamiento local. El cambio se ve ahora pero podría perderse al recargar la página.`, "warn");
+    }
   }catch(e){
     log(`No se pudo mejorar la imagen de "${p.title}" (${e.message || e}). Puede deberse a restricciones CORS de la imagen de origen.`, "err");
     if (btn){ btn.disabled = false; btn.textContent = "✨ Mejorar imagen"; }
@@ -3369,15 +3526,19 @@ function onUploadImageChange(p, event){
   }
 
   const reader = new FileReader();
-  reader.onload = () => {
+  reader.onload = async () => {
     p.image = reader.result;
     p.originalImage = reader.result;
     p.imageIsFallback = false;
     p.imageIsCustom = true;
     p.imageIsLocalEdit = false;
-    saveToStorage();
+    const saved = await saveToStorage();
     renderFeed();
-    log(`Imagen propia asignada a "${p.title}".`, "ok");
+    if (saved){
+      log(`Imagen propia asignada a "${p.title}".`, "ok");
+    } else {
+      log(`Imagen propia asignada a "${p.title}", pero no se pudo guardar en el almacenamiento local. El cambio se ve ahora pero podría perderse al recargar la página.`, "warn");
+    }
   };
   reader.onerror = () => {
     log(`No se pudo leer la imagen elegida para "${p.title}".`, "err");
@@ -3520,14 +3681,24 @@ async function composeLocalFallbackImage(p){
   }catch(e){ /* si el canvas quedó "tainted" por CORS, se sigue sin este realce */ }
   ctx.restore();
 
-  // Degradado amplio desde donde termina la imagen hasta bien entrado el
-  // bloque de texto, fundiéndose con BRAND.bgDeep — mismo efecto que la
-  // referencia, donde la imagen se oscurece progresivamente antes del
-  // texto en vez de cortar con un borde duro.
-  const fadeStart = Math.round(imgH * 0.72);
-  const fadeEnd = Math.round(imgH * 1.14);
+  // Degradado amplio que se dibuja POR ENCIMA de la imagen (no debajo):
+  // arranca bien adentro de la imagen, ya visiblemente oscureciéndola antes
+  // del borde inferior (no solo transparente ahí), y termina opaco bien
+  // pasado ese borde. Con solo dos paradas de color (0 y 1) la opacidad en
+  // el propio borde de la imagen (y=imgH) resultaba todavía muy baja, así
+  // que el corte real (imagen a color contra el negro sólido del panel de
+  // abajo) se seguía viendo como un borde recto en vez de un fundido. Las
+  // paradas intermedias fuerzan que, para cuando se llega a imgH, la
+  // opacidad ya sea alta y el contraste con el negro de abajo casi
+  // desaparezca.
+  const fadeStart = Math.round(imgH * 0.42);
+  const fadeEnd = Math.round(imgH * 1.18);
   const fade = ctx.createLinearGradient(0, fadeStart, 0, fadeEnd);
-  fade.addColorStop(0, "rgba(4,0,14,0)");
+  const fadeRgb = "6,0,10";
+  fade.addColorStop(0, `rgba(${fadeRgb},0)`);
+  fade.addColorStop(0.35, `rgba(${fadeRgb},0.28)`);
+  fade.addColorStop(0.55, `rgba(${fadeRgb},0.58)`);
+  fade.addColorStop(0.72, `rgba(${fadeRgb},0.86)`);
   fade.addColorStop(1, BRAND.bgDeep);
   ctx.fillStyle = fade;
   ctx.fillRect(0, fadeStart, W, fadeEnd - fadeStart);
@@ -3600,7 +3771,7 @@ async function composeLocalFallbackImage(p){
     lineWords.forEach((w, i) => {
       const wordText = w.text + (i < lineWords.length - 1 ? " " : "");
       const color = w.highlight ? BRAND.purpleLight : BRAND.white;
-      fillTextWithStroke(ctx, wordText, lx, ty, "rgba(0,0,0,0.95)", 22, color);
+      fillTextWithStroke(ctx, wordText, lx, ty, "rgba(0,0,0,0.85)", 14, color);
       lx += ctx.measureText(wordText).width;
     });
     ty += lineHeight;
